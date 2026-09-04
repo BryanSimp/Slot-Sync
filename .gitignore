@@ -1,0 +1,10 @@
+.env
+data/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.raw
+!tests/fixtures/*.raw
