@@ -39,7 +39,8 @@ Web UI at `http://localhost:8080`.
 Read [`PLAN.md`](PLAN.md). It is the spec, the milestone list, and the record of
 decisions. It is written to be handed to a coding session as-is.
 
-Protocol details are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+Protocol details are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md), and the verified
+GameCube memory card layout is in [`docs/MEMCARD.md`](docs/MEMCARD.md).
 
 ## Why "raw only"
 

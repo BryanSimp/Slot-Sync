@@ -36,9 +36,9 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "ts": _dt.datetime.fromtimestamp(
-                record.created, tz=_dt.UTC
-            ).isoformat(timespec="milliseconds"),
+            "ts": _dt.datetime.fromtimestamp(record.created, tz=_dt.UTC).isoformat(
+                timespec="milliseconds"
+            ),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),

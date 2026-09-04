@@ -12,10 +12,12 @@ from fastapi.testclient import TestClient
 
 from slotsync.app import create_app
 
-from .conftest import TEST_TOKEN
+from .conftest import TEST_TOKEN, make_card
 
-CARD_A = bytes(range(256)) * 16
-CARD_B = bytes(range(255, -1, -1)) * 16
+#: Real, structurally valid card images -- these go through validation on
+#: ingest just as a Dolphin daemon upload would.
+CARD_A = make_card("Zelda Quest Log")
+CARD_B = make_card("Mario Sunshine Save")
 
 AUTH = {"Authorization": f"Bearer {TEST_TOKEN}"}
 
@@ -106,7 +108,7 @@ def test_stale_parent_push_returns_409_with_the_head(client):
     push(client, CARD_A)
     push(client, CARD_B, parent=1)
 
-    response = push(client, b"third", parent=1)
+    response = push(client, make_card("Third Card"), parent=1)
 
     assert response.status_code == 409
     body = response.json()
@@ -117,7 +119,7 @@ def test_stale_parent_push_returns_409_with_the_head(client):
 
 def test_conflict_does_not_change_head(client):
     push(client, CARD_A)
-    push(client, b"nope", parent=99)
+    push(client, make_card("Nope"), parent=99)
     assert client.get("/api/cards/GALE01/A/latest.raw", headers=AUTH).content == CARD_A
 
 
@@ -137,9 +139,7 @@ def test_identical_repush_is_200_not_201(client):
 
 def test_parent_is_required(client):
     """Defaulting it would make every stale push a silent overwrite."""
-    response = client.post(
-        "/api/cards/GALE01/A", content=CARD_A, headers=AUTH
-    )
+    response = client.post("/api/cards/GALE01/A", content=CARD_A, headers=AUTH)
     assert response.status_code == 400
     assert "parent" in response.json()["detail"]
 
