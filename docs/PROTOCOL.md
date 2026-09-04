@@ -107,3 +107,84 @@ the payload to request only gaps. Server never retransmits unprompted.
   trusted LAN.
 - Nonce is for replay protection. The server keeps a short window of recently seen
   nonces per device. A kernel client can use a simple counter plus boot-time entropy.
+
+---
+
+# Settled while implementing M4
+
+Everything above held up. These are the details it did not pin down, decided while
+building the server and `scripts/fake_console.py`.
+
+## `card_version` is the transfer id on a push
+
+`PUSH_BEGIN`, `PUSH_CHUNK` and `PUSH_END` all carry the staging key
+`(device_id, game_id, slot, card_version)`, but at `PUSH_BEGIN` the client cannot know
+what version it will be assigned. So on the push path **`card_version` is an identifier
+the client chooses and echoes through the whole transfer**. The version the server
+actually assigns comes back in the `PUSH_END` ack, in the same field.
+
+A repeated `PUSH_BEGIN` for the same key **restarts** the transfer and discards whatever
+had accumulated. A client that resends `PUSH_BEGIN` is retrying, and keeping half-filled
+bytes from an earlier attempt is how you produce a card that passes its checksum and is
+still wrong.
+
+## `HELLO` ack payload
+
+```
+off  size  field
+0    8     server time, u64, unix seconds
+8    1     protocol version the server speaks
+```
+
+## Bitmaps are windowed
+
+A bitmap covering a whole 16 MiB card needs 2048 bytes, against a 1024-byte payload cap.
+So a bitmap covers a window, and **the header's `sequence` field carries the chunk index
+the bitmap starts at**. The server sends as many `NACK 0x06` datagrams as the gaps need;
+the client accumulates them until they stop arriving.
+
+Bit order is **LSB-first**: chunk `base + n` is `bitmap[n >> 3] & (1 << (n & 7))`. That
+is the cheapest form for the kernel client to walk.
+
+The same encoding runs the other way. A `PULL_REQ` carrying a payload is asking only for
+the chunks flagged in it, based at `sequence`; a `PULL_REQ` with no payload asks for the
+whole card.
+
+## `PULL_REQ` can name a version
+
+`card_version` selects which version to send. **0 means head.** Anything else asks for
+that specific version, which is how a console restores an older save without the web UI.
+
+## A conflict `NACK` carries the head
+
+`NACK 0x05` puts the server's current head version in `card_version`, so the client can
+pull it and let a human choose. Never merge, never last-write-wins — `PLAN.md` §7.
+
+## Bad HMAC is answered, not ignored
+
+A datagram that fails its HMAC gets a `NACK 0x01`. Nothing from it is trusted or echoed
+beyond the sequence number, and the reply is never larger than the request, so a spoofed
+source gets no amplification. Silence would leave a client built with the wrong PSK with
+no way to tell that apart from a dead server.
+
+## Chunks are not acked individually
+
+Only `PUSH_END` produces a reply. Acking every chunk would double the traffic for no
+benefit, since `PUSH_END` is where gaps are reported anyway.
+
+## Measured: pace the burst, and size the receive buffer
+
+Pushing a 2 MiB card as fast as the socket accepts it, over **loopback with no injected
+loss**, lost ~713 of 2048 chunks — about a third — and took four retransmission rounds.
+Nothing was dropped on the wire; the datagrams overran the server's socket receive
+buffer.
+
+Two fixes, both applied:
+
+- The server sets `SO_RCVBUF` to 4 MiB (`SLOTSYNC_UDP_RCVBUF`). With that alone the same
+  unpaced push completes in **one round with zero loss**.
+- Clients should still pace. `fake_console.py --pace 0.001` also gets a clean single
+  round, and the real console will be on 802.11g rather than loopback.
+
+The server paces its own pull the same way, 32 chunks per burst with a 2 ms gap
+(`SLOTSYNC_PULL_BURST`, `SLOTSYNC_PULL_BURST_DELAY`).

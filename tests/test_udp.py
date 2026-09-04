@@ -1,0 +1,564 @@
+"""M4: the UDP listener -- PLAN.md sections 3 and 4.
+
+Two layers. Most tests drive `SlotSyncProtocol` directly through a recording
+transport, which is deterministic and fast. The last few bind a real socket and
+run `scripts/fake_console.py` against it, including with loss and reordering
+injected -- that is the milestone's actual done condition.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import hashlib
+import struct
+
+import pytest
+
+import fake_console
+from slotsync.protocol import (
+    MAX_PAYLOAD,
+    Error,
+    Message,
+    MsgType,
+    chunk_count,
+    pack,
+    unpack,
+    unpack_bitmap,
+)
+from slotsync.store import Store
+from slotsync.udp import SlotSyncProtocol, start_listener
+
+from .conftest import TEST_PSK, make_card
+
+CARD = make_card("Zelda Quest Log")
+PEER = ("192.0.2.10", 40000)
+
+
+class RecordingTransport(asyncio.DatagramTransport):
+    """Collects what the server would have sent."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[bytes, tuple]] = []
+        self.closed = False
+
+    def sendto(self, data, addr=None) -> None:
+        self.sent.append((data, addr))
+
+    def close(self) -> None:
+        self.closed = True
+
+    def get_extra_info(self, name, default=None):
+        return {"sockname": ("0.0.0.0", 9977), "socket": None}.get(name, default)
+
+
+@pytest.fixture
+def server(config):
+    """A listener with a recording transport, not bound to a real port."""
+    protocol = SlotSyncProtocol(config, Store(config))
+    protocol.transport = RecordingTransport()
+    yield protocol
+
+
+def send(server, message: Message, *, key: bytes = TEST_PSK, addr=PEER) -> None:
+    server.datagram_received(pack(message, key), addr)
+
+
+def drain(server) -> list[Message]:
+    """Every reply so far, parsed."""
+    out = [unpack(data, TEST_PSK) for data, _ in server.transport.sent]
+    server.transport.sent.clear()
+    return out
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+async def deliver(server, *datagrams: bytes) -> None:
+    """Feed raw datagrams the way the loop would, then let the tasks finish.
+
+    `datagram_received` spawns a task for everything except PUSH_CHUNK, so it
+    needs a running loop. In production there always is one.
+    """
+    for datagram in datagrams:
+        server.datagram_received(datagram, PEER)
+    if server._tasks:
+        await asyncio.gather(*list(server._tasks), return_exceptions=True)
+
+
+def push_messages(image: bytes, *, game="GALE01", slot=0, parent=0, device=1, tid=1):
+    """The datagrams a client sends for one push."""
+    total = len(image)
+    common = {
+        "device_id": device,
+        "game_id": game,
+        "slot": slot,
+        "card_version": tid,
+    }
+    begin = Message(
+        msg_type=MsgType.PUSH_BEGIN,
+        total_size=total,
+        parent_version=parent,
+        **common,
+    )
+    chunks = [
+        Message(
+            msg_type=MsgType.PUSH_CHUNK,
+            offset=i * MAX_PAYLOAD,
+            sequence=i,
+            total_size=total,
+            payload=image[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD],
+            **common,
+        )
+        for i in range(chunk_count(total))
+    ]
+    end = Message(
+        msg_type=MsgType.PUSH_END,
+        total_size=total,
+        payload=hashlib.sha256(image).digest(),
+        **common,
+    )
+    return begin, chunks, end
+
+
+async def do_push(server, image, **kwargs):
+    """Run a whole push through the server, returning the final reply."""
+    begin, chunks, end = push_messages(image, **kwargs)
+    await server._dispatch(begin, PEER)
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    await server._dispatch(end, PEER)
+    return drain(server)
+
+
+# --- authentication -------------------------------------------------------
+
+
+def test_a_bad_hmac_is_nacked_not_ignored(server):
+    """Silence would leave a client built with the wrong PSK undiagnosable."""
+    send(server, Message(MsgType.HELLO, 1, "GALE01", 0), key=b"wrong-key")
+
+    replies = drain(server)
+    assert len(replies) == 1
+    assert replies[0].msg_type == MsgType.NACK
+    assert replies[0].payload[0] == Error.BAD_HMAC
+
+
+def test_the_reply_to_a_bad_datagram_is_no_larger_than_the_request(server):
+    """No amplification for a spoofed source to exploit."""
+    request = pack(Message(MsgType.PUSH_CHUNK, 1, "GALE01", 0, payload=b"x" * 512), b"k")
+    server.datagram_received(request, PEER)
+
+    reply, _ = server.transport.sent[0]
+    assert len(reply) <= len(request)
+
+
+def test_garbage_never_takes_the_listener_down(server):
+    junk = [b"", b"x", b"\x00" * 95, b"NOPE" + b"\x00" * 200, bytes(range(256))]
+    heartbeat = pack(Message(MsgType.HEARTBEAT, 1, "GALE01", 0), TEST_PSK)
+
+    run(deliver(server, *junk, heartbeat))
+
+    # Still serving.
+    assert drain(server)[-1].msg_type == MsgType.ACK
+
+
+def test_an_unknown_message_type_is_nacked(server):
+    run(server._dispatch(Message(0x7F, 1, "GALE01", 0), PEER))
+    assert drain(server)[0].payload[0] == Error.MALFORMED_HEADER
+
+
+# --- hello and heartbeat --------------------------------------------------
+
+
+def test_hello_returns_server_time_and_protocol_version(server):
+    run(server._dispatch(Message(MsgType.HELLO, 42, "", 0), PEER))
+
+    reply = drain(server)[0]
+    assert reply.msg_type == MsgType.ACK
+    server_time, version = struct.unpack(">QB", reply.payload[:9])
+    assert version == 1
+    assert server_time > 1_700_000_000
+
+
+def test_hello_records_the_device(server):
+    run(server._dispatch(Message(MsgType.HELLO, 42, "", 0), PEER))
+    assert [d.device_id for d in server.store.list_devices()] == [42]
+
+
+def test_heartbeat_is_acked_and_has_no_side_effects(server):
+    """It exists to keep a NAT mapping open; sending the packet is the whole
+    point, so it must not touch staging expiry."""
+    run(server._dispatch(*_begin(CARD)))
+    drain(server)
+    before = {k: v.last_chunk_at for k, v in server.staging.items()}
+
+    run(server._dispatch(Message(MsgType.HEARTBEAT, 1, "GALE01", 0), PEER))
+
+    assert drain(server)[0].msg_type == MsgType.ACK
+    assert {k: v.last_chunk_at for k, v in server.staging.items()} == before
+
+
+def _begin(image, **kwargs):
+    begin, _, _ = push_messages(image, **kwargs)
+    return begin, PEER
+
+
+# --- push -----------------------------------------------------------------
+
+
+def test_a_complete_push_commits(server):
+    replies = run(do_push(server, CARD))
+
+    assert replies[-1].msg_type == MsgType.ACK
+    assert replies[-1].card_version == 1
+    assert server.store.read_image(server.store.head("GALE01", 0)) == CARD
+
+
+def test_the_committed_image_is_byte_identical(server):
+    run(do_push(server, CARD))
+    assert server.store.read_image(server.store.head("GALE01", 0)) == CARD
+
+
+def test_chunks_may_arrive_in_any_order(server):
+    begin, chunks, end = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in reversed(chunks):
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    run(server._dispatch(end, PEER))
+
+    assert drain(server)[-1].msg_type == MsgType.ACK
+    assert server.store.read_image(server.store.head("GALE01", 0)) == CARD
+
+
+def test_duplicate_chunks_are_harmless(server):
+    begin, chunks, end = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks + chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    run(server._dispatch(end, PEER))
+
+    assert drain(server)[-1].msg_type == MsgType.ACK
+
+
+def test_chunks_are_not_acked_individually(server):
+    """Acking each chunk would double the traffic; gaps are reported at
+    PUSH_END instead."""
+    begin, chunks, _ = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    drain(server)
+
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+
+    assert server.transport.sent == []
+
+
+def test_gaps_come_back_as_a_nack_bitmap(server):
+    begin, chunks, end = push_messages(CARD)
+    dropped = {3, 17, 200}
+    run(server._dispatch(begin, PEER))
+    for index, chunk in enumerate(chunks):
+        if index not in dropped:
+            server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+
+    run(server._dispatch(end, PEER))
+
+    replies = drain(server)
+    assert all(r.msg_type == MsgType.NACK for r in replies)
+    assert replies[0].payload[0] == Error.MISSING_CHUNKS
+
+    missing = []
+    for reply in replies:
+        missing += unpack_bitmap(reply.payload[1:], reply.sequence)
+    assert set(missing) == dropped
+
+
+def test_nothing_is_committed_until_push_end(server):
+    begin, chunks, _ = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+
+    assert server.store.head("GALE01", 0) is None
+
+
+def test_a_wrong_digest_is_rejected_and_the_buffer_dropped(server):
+    begin, chunks, end = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+
+    liar = dataclasses.replace(end, payload=hashlib.sha256(b"something else").digest())
+    run(server._dispatch(liar, PEER))
+
+    assert drain(server)[0].payload[0] == Error.CHECKSUM_MISMATCH
+    assert server.store.head("GALE01", 0) is None
+    assert server.staging == {}
+
+
+def test_a_stale_parent_is_a_conflict_carrying_the_head(server):
+    run(do_push(server, CARD))
+    other = make_card("Something Else")
+    run(do_push(server, other, parent=1, tid=2))
+
+    replies = run(do_push(server, make_card("Third"), parent=1, tid=3))
+
+    assert replies[-1].msg_type == MsgType.NACK
+    assert replies[-1].payload[0] == Error.CONFLICT
+    # The head rides in card_version so the client can pull it and let a human
+    # choose rather than guessing.
+    assert replies[-1].card_version == 2
+
+
+def test_an_identical_repush_is_a_free_no_op(server):
+    run(do_push(server, CARD))
+    replies = run(do_push(server, CARD, tid=2))
+
+    assert replies[-1].msg_type == MsgType.ACK
+    assert replies[-1].card_version == 1
+    assert len(server.store.history("GALE01", 0)) == 1
+
+
+def test_a_card_that_fails_validation_is_rejected(server):
+    replies = run(do_push(server, b"\x00" * 4096))
+    assert replies[-1].payload[0] == Error.FAILED_VALIDATION
+
+
+def test_an_oversized_declaration_is_refused_up_front(server):
+    begin, _, _ = push_messages(CARD)
+    run(server._dispatch(dataclasses.replace(begin, total_size=64 * 1024 * 1024), PEER))
+    assert drain(server)[0].payload[0] == Error.TOO_LARGE
+    assert server.staging == {}
+
+
+def test_a_chunk_without_a_staging_buffer_is_nacked(server):
+    _, chunks, _ = push_messages(CARD)
+    server.datagram_received(pack(chunks[0], TEST_PSK), PEER)
+    assert drain(server)[0].payload[0] == Error.STAGING_EXPIRED
+
+
+def test_push_end_without_a_staging_buffer_is_nacked(server):
+    _, _, end = push_messages(CARD)
+    run(server._dispatch(end, PEER))
+    assert drain(server)[0].payload[0] == Error.STAGING_EXPIRED
+
+
+def test_concurrent_staging_buffers_are_capped(config):
+    small = dataclasses.replace(config, max_staging=2)
+    server = SlotSyncProtocol(small, Store(small))
+    server.transport = RecordingTransport()
+
+    for tid in range(3):
+        begin, _, _ = push_messages(CARD, tid=tid)
+        run(server._dispatch(begin, PEER))
+
+    assert len(server.staging) == 2
+    assert drain(server)[-1].payload[0] == Error.RATE_LIMITED
+
+
+def test_restarting_a_transfer_discards_the_old_bytes(server):
+    """A repeated PUSH_BEGIN means the client is retrying. Keeping half-filled
+    bytes is how you get a card that passes its checksum and is still wrong."""
+    begin, chunks, _ = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    server.datagram_received(pack(chunks[0], TEST_PSK), PEER)
+    run(server._dispatch(begin, PEER))
+
+    staging = next(iter(server.staging.values()))
+    assert staging.received_count == 0
+    assert not any(staging.data)
+
+
+# --- expiry ---------------------------------------------------------------
+
+
+def test_a_quiet_staging_buffer_expires(server):
+    run(server._dispatch(*_begin(CARD)))
+    assert len(server.staging) == 1
+
+    staging = next(iter(server.staging.values()))
+    assert server.sweep(now=staging.last_chunk_at + 1) == 0
+    assert server.sweep(now=staging.last_chunk_at + 121) == 1
+    assert server.staging == {}
+
+
+def test_expiry_never_disturbs_the_current_head(server):
+    """A console that loses power mid-transfer must not cost anyone a save."""
+    run(do_push(server, CARD))
+    run(server._dispatch(*_begin(make_card("Half Sent"), tid=9)))
+
+    staging = next(iter(server.staging.values()))
+    server.sweep(now=staging.last_chunk_at + 121)
+
+    assert server.store.read_image(server.store.head("GALE01", 0)) == CARD
+
+
+# --- pull -----------------------------------------------------------------
+
+
+def test_pull_returns_the_head_in_order(server):
+    run(do_push(server, CARD))
+    drain(server)
+
+    run(server._dispatch(Message(MsgType.PULL_REQ, 1, "GALE01", 0), PEER))
+
+    replies = drain(server)
+    ack, chunks = replies[0], replies[1:]
+    assert ack.msg_type == MsgType.ACK
+    assert ack.total_size == len(CARD)
+    assert ack.card_version == 1
+
+    assert [c.sequence for c in chunks] == list(range(chunk_count(len(CARD))))
+    assert b"".join(c.payload for c in chunks) == CARD
+
+
+def test_pull_can_name_an_older_version(server):
+    run(do_push(server, CARD))
+    other = make_card("Newer")
+    run(do_push(server, other, parent=1, tid=2))
+    drain(server)
+
+    run(server._dispatch(Message(MsgType.PULL_REQ, 1, "GALE01", 0, card_version=1), PEER))
+
+    replies = drain(server)
+    assert replies[0].card_version == 1
+    assert b"".join(c.payload for c in replies[1:]) == CARD
+
+
+def test_a_pull_bitmap_asks_for_only_the_gaps(server):
+    run(do_push(server, CARD))
+    drain(server)
+
+    wanted = [2, 5, 40]
+    bitmap = bytearray(64)
+    for index in wanted:
+        bitmap[index >> 3] |= 1 << (index & 7)
+
+    run(
+        server._dispatch(
+            Message(MsgType.PULL_REQ, 1, "GALE01", 0, sequence=0, payload=bytes(bitmap)),
+            PEER,
+        )
+    )
+
+    chunks = [r for r in drain(server) if r.msg_type == MsgType.PULL_CHUNK]
+    assert [c.sequence for c in chunks] == wanted
+
+
+def test_pulling_an_unknown_card_is_nacked(server):
+    run(server._dispatch(Message(MsgType.PULL_REQ, 1, "ZZZZ99", 1), PEER))
+    assert drain(server)[0].payload[0] == Error.UNKNOWN_CARD
+
+
+def test_pulling_an_unknown_version_is_nacked(server):
+    run(do_push(server, CARD))
+    drain(server)
+    run(
+        server._dispatch(Message(MsgType.PULL_REQ, 1, "GALE01", 0, card_version=99), PEER)
+    )
+    assert drain(server)[0].payload[0] == Error.UNKNOWN_CARD
+
+
+# --- both transports, one store -------------------------------------------
+
+
+def test_a_udp_push_is_visible_over_http(config):
+    """PLAN.md section 3: a card pushed from a Wii and one pushed from Dolphin
+    are indistinguishable once committed."""
+    from fastapi.testclient import TestClient
+
+    from slotsync.app import create_app
+
+    from .conftest import TEST_TOKEN
+
+    app = create_app(config)
+    server = SlotSyncProtocol(config, app.state.store)
+    server.transport = RecordingTransport()
+
+    run(do_push(server, CARD))
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/cards/GALE01/A/latest.raw",
+            headers={"Authorization": f"Bearer {TEST_TOKEN}"},
+        )
+    assert response.content == CARD
+
+
+# --- against a real socket ------------------------------------------------
+
+
+def _run_real(config, work):
+    """Bind the listener and run a blocking client against it in a thread."""
+
+    async def main():
+        store = Store(config)
+        transport, protocol = await start_listener(config, store)
+        port = transport.get_extra_info("sockname")[1]
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, work, port
+            ), store
+        finally:
+            transport.close()
+
+    return asyncio.run(main())
+
+
+@pytest.fixture
+def udp_config(config):
+    # Port 0 lets the OS pick, so the suite never fights a real server.
+    return dataclasses.replace(config, udp_port=0, udp_host="127.0.0.1")
+
+
+def test_fake_console_round_trips_a_card(udp_config, tmp_path):
+    """The M4 done condition, first half: a real push and pull over sockets."""
+    source = tmp_path / "card.raw"
+    source.write_bytes(CARD)
+    out = tmp_path / "out.raw"
+
+    def work(port):
+        link = fake_console.Link("127.0.0.1", port, TEST_PSK, timeout=1.0)
+        try:
+            fake_console.do_push(link, 1, "GALE01", 0, source, 0, 1, 8, 0.0)
+            fake_console.do_pull(link, 1, "GALE01", 0, out, 0, 8)
+        finally:
+            link.close()
+
+    _run_real(udp_config, work)
+    assert out.read_bytes() == CARD
+
+
+def test_fake_console_survives_loss_and_reordering(udp_config, tmp_path):
+    """The M4 done condition, second half. Seeded so a failure reproduces."""
+    source = tmp_path / "card.raw"
+    source.write_bytes(CARD)
+    out = tmp_path / "out.raw"
+
+    def work(port):
+        # Each retransmission round ends by waiting out a recv timeout, so
+        # this number dominates the test's runtime. Loopback RTT is
+        # microseconds; half a second is already enormous.
+        pusher = fake_console.Link(
+            "127.0.0.1", port, TEST_PSK, loss=0.2, reorder=True, seed=7, timeout=0.5
+        )
+        puller = fake_console.Link(
+            "127.0.0.1", port, TEST_PSK, loss=0.2, seed=11, timeout=0.5
+        )
+        try:
+            fake_console.do_push(pusher, 1, "GALE01", 0, source, 0, 1, 20, 0.0)
+            assert pusher.dropped_out > 0, "the test injected no loss"
+            fake_console.do_pull(puller, 1, "GALE01", 0, out, 0, 20)
+        finally:
+            pusher.close()
+            puller.close()
+
+    _run_real(udp_config, work)
+    assert out.read_bytes() == CARD

@@ -34,6 +34,30 @@ class Config:
     max_card_bytes: int = 16 * 1024 * 1024
     log_level: str = "INFO"
 
+    #: Off unless explicitly enabled, so importing the app in a test never
+    #: binds a UDP port. `from_env` turns it on.
+    enable_udp: bool = False
+
+    #: Seconds a staging buffer survives without a chunk -- PLAN.md section 4.
+    staging_ttl: float = 120.0
+
+    #: Concurrent staging buffers. A cap, not a target: each one holds a whole
+    #: card in memory.
+    max_staging: int = 64
+
+    #: Chunks sent back-to-back during a pull before yielding. A 2 MiB card is
+    #: 2048 datagrams and a 2006 WiFi stack will drop most of them if they all
+    #: arrive at once, so the burst is paced.
+    pull_burst: int = 32
+    pull_burst_delay: float = 0.002
+
+    #: UDP receive buffer. A 2 MiB card arrives as 2048 datagrams; with the
+    #: default socket buffer the kernel drops roughly a third of an unpaced
+    #: burst before the listener ever sees them. The protocol recovers via
+    #: NACK, but paying for it in retransmissions is silly when the fix is one
+    #: setsockopt. The OS may clamp this.
+    udp_rcvbuf: int = 4 * 1024 * 1024
+
     @property
     def blobs_dir(self) -> Path:
         return self.data_dir / "blobs"
@@ -64,6 +88,12 @@ class Config:
             udp_port=_int(src, "SLOTSYNC_UDP_PORT", 9977),
             max_card_bytes=_int(src, "SLOTSYNC_MAX_CARD_BYTES", 16 * 1024 * 1024),
             log_level=src.get("SLOTSYNC_LOG_LEVEL", "INFO").upper(),
+            enable_udp=True,
+            staging_ttl=_float(src, "SLOTSYNC_STAGING_TTL", 120.0),
+            max_staging=_int(src, "SLOTSYNC_MAX_STAGING", 64),
+            pull_burst=_int(src, "SLOTSYNC_PULL_BURST", 32),
+            pull_burst_delay=_float(src, "SLOTSYNC_PULL_BURST_DELAY", 0.002),
+            udp_rcvbuf=_int(src, "SLOTSYNC_UDP_RCVBUF", 4 * 1024 * 1024),
         )
 
 
@@ -85,3 +115,13 @@ def _int(src, name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _float(src, name: str, default: float) -> float:
+    raw = src.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from exc

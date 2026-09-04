@@ -6,7 +6,9 @@ tests from needing a live server.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -23,6 +25,7 @@ from .store import (
     TooLargeError,
     ValidationError,
 )
+from .udp import start_listener
 from .web import router as web_router
 
 log = logging.getLogger("slotsync.app")
@@ -30,12 +33,30 @@ log = logging.getLogger("slotsync.app")
 
 def create_app(config: Config) -> FastAPI:
     """Build the application for `config`."""
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """Bring the UDP listener up on uvicorn's loop.
+
+        PLAN.md section 12: one process, two ports. Doing it here rather than in
+        __main__ means both transports share the loop and the same Store.
+        """
+        transport = None
+        if config.enable_udp:
+            transport, app.state.udp = await start_listener(config, app.state.store)
+        try:
+            yield
+        finally:
+            if transport is not None:
+                transport.close()
+
     app = FastAPI(
         title="SlotSync",
         version=__version__,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.config = config
     app.state.store = Store(config)
