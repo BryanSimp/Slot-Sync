@@ -23,6 +23,7 @@ from .store import (
     TooLargeError,
     ValidationError,
 )
+from .web import router as web_router
 
 log = logging.getLogger("slotsync.app")
 
@@ -45,6 +46,8 @@ def create_app(config: Config) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     app.include_router(api_router)
+    # The UI is mounted last: its routes are the catch-all ones.
+    app.include_router(web_router)
     _install_error_handlers(app)
 
     log.info(

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}SlotSync{% endblock %}</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f26;
+    --panel-2: #23272f;
+    --line: #2f3540;
+    --ink: #e6e9ef;
+    --muted: #98a2b3;
+    --accent: #6aa9ff;
+    --warn: #f0b429;
+    --warn-bg: #3a2d0d;
+    --danger: #ff6b6b;
+    --danger-bg: #3a1620;
+    --ok: #4ade80;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --line: #d8dde5;
+      --ink: #1b1f27; --muted: #5b6472; --accent: #1f6feb;
+      --warn: #8a6100; --warn-bg: #fff4d6; --danger: #b42318; --danger-bg: #fee4e2;
+      --ok: #15803d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header {
+    display: flex; align-items: center; gap: 1rem;
+    padding: .9rem 1.25rem; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
+  header .spacer { flex: 1; }
+  main { max-width: 1000px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  h2 { font-size: 1.15rem; margin: 2rem 0 .75rem; }
+  h2:first-child { margin-top: 0; }
+  p.muted, .muted { color: var(--muted); }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85em;
+  }
+
+  table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  th, td { text-align: left; padding: .55rem .75rem; border-bottom: 1px solid var(--line); }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--panel-2); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .banner { padding: .8rem 1rem; border-radius: 8px; margin-bottom: 1.25rem; border: 1px solid; }
+  .banner h3 { margin: 0 0 .35rem; font-size: .95rem; }
+  .banner.warn { background: var(--warn-bg); border-color: var(--warn); }
+  .banner.danger { background: var(--danger-bg); border-color: var(--danger); }
+  .banner ul { margin: .4rem 0 0; padding-left: 1.1rem; }
+  .banner[hidden] { display: none; }
+
+  .btn {
+    display: inline-block; padding: .35rem .7rem; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+    font: inherit; font-size: .85rem; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); text-decoration: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #06101f; }
+  .btn.danger { border-color: var(--danger); color: var(--danger); }
+  form.inline { display: inline; }
+
+  .pill {
+    display: inline-block; padding: .1rem .45rem; border-radius: 999px;
+    font-size: .75rem; border: 1px solid var(--line); color: var(--muted);
+  }
+  .pill.head { border-color: var(--ok); color: var(--ok); }
+
+  .grid { display: grid; gap: .35rem 1.5rem; grid-template-columns: auto 1fr; }
+  .grid dt { color: var(--muted); }
+  .grid dd { margin: 0; }
+
+  .card-panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 1rem 1.25rem;
+  }
+  label { display: block; margin-bottom: .35rem; color: var(--muted); font-size: .85rem; }
+  input[type=text], input[type=password], input[type=file] {
+    width: 100%; padding: .5rem .6rem; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">SlotSync</a></h1>
+  <span class="spacer"></span>
+  {% block nav %}{% endblock %}
+  <form method="post" action="/logout" class="inline">
+    <button class="btn" type="submit">Sign out</button>
+  </form>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>
