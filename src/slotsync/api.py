@@ -35,18 +35,36 @@ router = APIRouter(prefix="/api")
 # --- auth -----------------------------------------------------------------
 
 
+#: Where the browser keeps the same shared token. Still one secret and no
+#: accounts -- a cookie is just the only credential a plain <a href> or form
+#: POST can carry. See PLAN.md section 9.
+COOKIE_NAME = "slotsync_token"
+
+
+def token_is_valid(request: Request, presented: str) -> bool:
+    """compare_digest, so a wrong token cannot be recovered by timing."""
+    return hmac.compare_digest(presented, request.app.state.config.token)
+
+
+def presented_token(request: Request, authorization: str | None) -> str:
+    """The token from the Authorization header, falling back to the cookie."""
+    scheme, _, value = (authorization or "").partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return value
+    return request.cookies.get(COOKIE_NAME, "")
+
+
 def require_token(
     request: Request, authorization: str | None = Header(default=None)
 ) -> None:
-    """Check the shared bearer token.
+    """Check the shared token.
 
-    Single household, one token, no accounts -- PLAN.md section 11. Compared
-    with compare_digest so a wrong token cannot be recovered by timing.
+    Single household, one token, no accounts -- PLAN.md section 11. Machine
+    clients send `Authorization: Bearer`; the web UI sends the cookie the login
+    form set. The cookie is SameSite=Lax, so a cross-site form POST cannot ride
+    on it.
     """
-    expected = request.app.state.config.token
-    scheme, _, presented = (authorization or "").partition(" ")
-
-    if scheme.lower() != "bearer" or not hmac.compare_digest(presented, expected):
+    if not token_is_valid(request, presented_token(request, authorization)):
         raise AuthError()
 
 

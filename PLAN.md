@@ -317,6 +317,27 @@ Must show: every card, its games (parsed from the directory, with real save name
 block counts), version history with timestamps and originating device, a download
 button per version, a rollback button, and a clear conflict banner when one exists.
 
+### Settled while building M3
+
+- **The browser signs in with the same shared token, carried in a cookie.** A `<a href>`
+  download or a form POST cannot set an `Authorization` header, so the API accepts either
+  a bearer header (machine clients) or the cookie the login form sets. Still one secret
+  and no accounts — §11 holds. The cookie is `HttpOnly` and `SameSite=Lax`, which is what
+  stops a cross-site POST from riding on it; there is no separate CSRF token.
+- **Conflict resolution is "keep mine" or "keep theirs". Fork is not built.** Forking
+  needs a second lineage per `(game_id, slot)`, and the schema in §6 has one `head` per
+  card with no room for it. Add it only if the two-way choice proves insufficient in
+  practice.
+- "Keep mine" is an ordinary push re-aimed at the head from the 409 — the losing version
+  stays in history and can be restored, so the choice is never destructive. The page
+  keeps the selected file in JavaScript across the rejection rather than the server
+  parking the upload, which keeps the conflict path free of new server state.
+- Everything except the upload form works with JavaScript off: rollback is a form POST
+  and downloads are links.
+- Route names in `web.py` are prefixed `web_`. `url_for` resolves names across the whole
+  app, and `api.py` already had a `card_detail`, so unprefixed names sent the UI's
+  redirects into the JSON API.
+
 ---
 
 ## 10. Milestones

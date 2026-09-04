@@ -173,7 +173,11 @@ def build_card(
 
 
 def _parse_save(text: str) -> SaveSpec:
-    """GAMEID:filename:title:subtitle:blocks -- all but the first optional."""
+    """GAMEID:filename:title:subtitle:blocks -- all but the first optional.
+
+    Fields are colon-separated, so none of them can contain a colon. Call
+    `build_card` directly if a fixture needs "Zelda: The Wind Waker" verbatim.
+    """
     parts = text.split(":")
     game = parts[0]
     if len(game) != 6:

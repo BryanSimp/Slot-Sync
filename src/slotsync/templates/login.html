@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — SlotSync</title>
+<style>
+  :root { --bg:#14161a; --panel:#1c1f26; --line:#2f3540; --ink:#e6e9ef;
+          --muted:#98a2b3; --accent:#6aa9ff; --danger:#ff6b6b; --danger-bg:#3a1620; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#d8dde5; --ink:#1b1f27;
+            --muted:#5b6472; --accent:#1f6feb; --danger:#b42318; --danger-bg:#fee4e2; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; min-height:100vh; display:grid; place-items:center;
+    background:var(--bg); color:var(--ink);
+    font:15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  form {
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:1.75rem; width:min(24rem, 92vw);
+  }
+  h1 { margin:0 0 .35rem; font-size:1.1rem; }
+  p { margin:0 0 1.25rem; color:var(--muted); font-size:.9rem; }
+  label { display:block; margin-bottom:.35rem; color:var(--muted); font-size:.85rem; }
+  input {
+    width:100%; padding:.55rem .65rem; border-radius:6px; border:1px solid var(--line);
+    background:var(--bg); color:var(--ink); font:inherit;
+  }
+  button {
+    margin-top:1rem; width:100%; padding:.55rem; border-radius:6px; border:0;
+    background:var(--accent); color:#06101f; font:inherit; font-weight:600; cursor:pointer;
+  }
+  .error {
+    background:var(--danger-bg); border:1px solid var(--danger); color:var(--ink);
+    border-radius:6px; padding:.55rem .7rem; margin-bottom:1rem; font-size:.88rem;
+  }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>SlotSync</h1>
+  <p>Enter the shared token from <code>SLOTSYNC_TOKEN</code>.</p>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <label for="token">Token</label>
+  <input id="token" name="token" type="password" autocomplete="current-password"
+         autofocus required>
+  <input type="hidden" name="next" value="{{ next }}">
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>

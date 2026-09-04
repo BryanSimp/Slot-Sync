@@ -1,0 +1,237 @@
+{% extends "base.html" %}
+{% block title %}{{ head.game_id }} slot {{ head.slot_name }} — SlotSync{% endblock %}
+
+{% block content %}
+<h2 style="margin-bottom:.25rem">
+  {{ head.game_id }} <span class="muted">slot {{ head.slot_name }}</span>
+</h2>
+<p class="muted" style="margin-top:0">
+  Version {{ head.version }} · {{ head.size | filesize }} ·
+  updated {{ head.created_at | timestamp }}
+</p>
+
+<!-- Conflict banner. Hidden until a push is rejected; PLAN.md sections 7 and 9. -->
+<div class="banner danger" id="conflict" hidden>
+  <h3>Someone else changed this card</h3>
+  <p style="margin:.2rem 0 .6rem">
+    Your upload was built on version <span id="conflict-parent" class="mono"></span>,
+    but the server is already on version <span id="conflict-head" class="mono"></span>.
+    Nothing has been overwritten. Pick one:
+  </p>
+  <button class="btn danger" id="keep-mine" type="button">Keep mine</button>
+  <button class="btn" id="keep-theirs" type="button">Keep theirs</button>
+  <p class="muted" style="margin:.6rem 0 0; font-size:.85rem">
+    "Keep mine" pushes your file as a new version on top. The server's current
+    version stays in the history below and can be restored at any time.
+  </p>
+</div>
+
+<div class="banner danger" id="push-error" hidden>
+  <h3>Push failed</h3>
+  <p style="margin:.2rem 0 0" id="push-error-detail"></p>
+</div>
+
+{% if parse_error %}
+  <div class="banner danger">
+    <h3>This card no longer parses</h3>
+    <p style="margin:.2rem 0 0">{{ parse_error }}</p>
+  </div>
+{% elif card and card.warnings %}
+  <div class="banner warn">
+    <h3>Stored with damage</h3>
+    <p style="margin:.2rem 0 0">
+      The card was accepted because a good copy of everything critical survives, and
+      a console normally repairs this on next boot.
+    </p>
+    <ul>{% for warning in card.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+  </div>
+{% endif %}
+
+{% if card %}
+<h2>Card</h2>
+<div class="card-panel">
+  <dl class="grid">
+    <dt>Size</dt><dd>{{ card.size_bytes | filesize }} ({{ card.size_mbits }} Mbit)</dd>
+    <dt>Blocks</dt>
+    <dd>{{ card.used_blocks }} used, {{ card.free_blocks }} free of {{ card.data_blocks }}</dd>
+    <dt>Encoding</dt><dd>{{ card.encoding_name }}</dd>
+    <dt>Formatted</dt>
+    <dd>{% if card.formatted_at %}{{ card.formatted_at.strftime("%Y-%m-%d") }}{% else %}—{% endif %}</dd>
+    <dt>Live copies</dt>
+    <dd class="muted">
+      directory {{ card.active_directory }}, BAT {{ card.active_bat }}
+    </dd>
+  </dl>
+</div>
+
+<h2>Saves on this card</h2>
+{% if not card.saves %}
+  <p class="muted">The card is formatted but empty.</p>
+{% else %}
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Save</th>
+          <th>Game</th>
+          <th>File</th>
+          <th class="num">Blocks</th>
+          <th class="num">Size</th>
+          <th>Modified</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for save in card.saves %}
+        <tr>
+          <td>
+            <strong>{{ save.display_name }}</strong>
+            {% if save.subtitle %}<br><span class="muted">{{ save.subtitle }}</span>{% endif %}
+            {% if save.no_copy %} <span class="pill">no copy</span>{% endif %}
+            {% if save.no_move %} <span class="pill">no move</span>{% endif %}
+          </td>
+          <td class="mono">{{ save.game_code }}{{ save.maker_code }}</td>
+          <td class="mono">{{ save.filename }}</td>
+          <td class="num">{{ save.block_count }}</td>
+          <td class="num">{{ save.size_bytes | filesize }}</td>
+          <td>
+            {% if save.modified %}{{ save.modified.strftime("%Y-%m-%d") }}{% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+{% endif %}
+
+<h2>Version history</h2>
+<div class="scroll">
+  <table>
+    <thead>
+      <tr>
+        <th class="num">Version</th>
+        <th>When</th>
+        <th>Device</th>
+        <th class="num">Size</th>
+        <th>Digest</th>
+        <th>Note</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for version in history %}
+      <tr>
+        <td class="num">
+          {{ version.version }}
+          {% if version.version == head.version %}<span class="pill head">head</span>{% endif %}
+        </td>
+        <td>{{ version.created_at | timestamp }}</td>
+        <td class="mono">
+          {% if version.device_id is none %}—{% else %}{{ "%016x" | format(version.device_id) }}{% endif %}
+        </td>
+        <td class="num">{{ version.size | filesize }}</td>
+        <td class="mono" title="{{ version.sha256 }}">{{ version.sha256[:12] }}</td>
+        <td class="muted">{{ version.note or "" }}</td>
+        <td style="white-space:nowrap">
+          <a class="btn"
+             href="/api/cards/{{ version.game_id }}/{{ version.slot_name }}/{{ version.version }}.raw">
+            Download
+          </a>
+          {% if version.version != head.version %}
+            <form method="post" class="inline"
+                  action="/cards/{{ version.game_id }}/{{ version.slot_name }}/rollback/{{ version.version }}">
+              <button class="btn" type="submit">Restore</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Push a card</h2>
+<div class="card-panel" id="uploader"
+     data-game="{{ head.game_id }}" data-slot="{{ head.slot }}" data-head="{{ head.version }}">
+  <label for="file">Raw memory card image (<code>.raw</code>)</label>
+  <input id="file" type="file" accept=".raw,application/octet-stream">
+  <button class="btn primary" id="push" type="button" style="margin-top:.75rem">Push</button>
+  <span class="muted" id="push-status" style="margin-left:.5rem"></span>
+</div>
+
+<script>
+// The only real JS on the site. It exists because resolving a conflict needs
+// the chosen file to still be in hand after the first push is rejected --
+// see PLAN.md section 7. Everything else on this page is links and form posts.
+(function () {
+  const panel = document.getElementById("uploader");
+  const fileInput = document.getElementById("file");
+  const pushButton = document.getElementById("push");
+  const status = document.getElementById("push-status");
+  const conflict = document.getElementById("conflict");
+  const pushError = document.getElementById("push-error");
+
+  const gameId = panel.dataset.game;
+  const slot = panel.dataset.slot;
+  let parent = Number(panel.dataset.head);
+
+  function show(el, on) { el.hidden = !on; }
+
+  async function push(parentVersion) {
+    const file = fileInput.files[0];
+    if (!file) { status.textContent = "Choose a file first."; return; }
+
+    show(conflict, false);
+    show(pushError, false);
+    pushButton.disabled = true;
+    status.textContent = "Uploading…";
+
+    try {
+      const url = `/api/cards/${gameId}/${slot}?parent=${parentVersion}`;
+      const response = await fetch(url, {
+        method: "POST",
+        body: file,
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+      const body = await response.json().catch(() => ({}));
+
+      if (response.status === 409) {
+        document.getElementById("conflict-parent").textContent = parentVersion;
+        document.getElementById("conflict-head").textContent = body.head;
+        parent = body.head;          // "keep mine" rebases onto the real head
+        show(conflict, true);
+        status.textContent = "";
+        return;
+      }
+
+      if (!response.ok) {
+        document.getElementById("push-error-detail").textContent =
+          body.detail || `${response.status} ${response.statusText}`;
+        show(pushError, true);
+        status.textContent = "";
+        return;
+      }
+
+      status.textContent =
+        body.outcome === "unchanged"
+          ? "Already stored — nothing changed."
+          : `Stored as version ${body.version}.`;
+      setTimeout(() => window.location.reload(), 600);
+    } catch (err) {
+      document.getElementById("push-error-detail").textContent = String(err);
+      show(pushError, true);
+      status.textContent = "";
+    } finally {
+      pushButton.disabled = false;
+    }
+  }
+
+  pushButton.addEventListener("click", () => push(parent));
+  document.getElementById("keep-mine").addEventListener("click", () => push(parent));
+  document.getElementById("keep-theirs").addEventListener("click", () => {
+    show(conflict, false);
+    status.textContent = "Kept the server's version. Your file was not uploaded.";
+  });
+})();
+</script>
+{% endblock %}

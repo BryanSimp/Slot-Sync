@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Cards — SlotSync{% endblock %}
+
+{% block content %}
+<h2>Memory cards</h2>
+
+{% if not cards %}
+  <div class="card-panel">
+    <p class="muted" style="margin:0">
+      Nothing stored yet. Push a card and it will show up here — from the Dolphin
+      daemon, from a console over UDP, or by hand:
+    </p>
+    <pre class="mono" style="margin:.75rem 0 0; overflow-x:auto"><code>curl -X POST -H "Authorization: Bearer $SLOTSYNC_TOKEN" \
+     --data-binary @GALE01.raw \
+     "http://localhost:8080/api/cards/GALE01/A?parent=0"</code></pre>
+  </div>
+{% else %}
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Game</th>
+          <th>Slot</th>
+          <th class="num">Head</th>
+          <th class="num">Versions</th>
+          <th class="num">Size</th>
+          <th>Last device</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for card in cards %}
+        <tr>
+          <td>
+            <a href="/cards/{{ card.game_id }}/{{ card.slot_name }}">{{ card.game_id }}</a>
+          </td>
+          <td>{{ card.slot_name }}</td>
+          <td class="num">{{ card.head }}</td>
+          <td class="num">{{ card.versions }}</td>
+          <td class="num">{{ card.size | filesize }}</td>
+          <td class="mono">
+            {% if card.device_id is none %}—{% else %}{{ "%016x" | format(card.device_id) }}{% endif %}
+          </td>
+          <td>{{ card.updated_at | timestamp }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+{% endblock %}
