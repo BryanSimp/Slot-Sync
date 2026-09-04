@@ -10,6 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 
+# `python -m slotsync` resolves the package from here.
+ENV PYTHONPATH=/app/src
+
 ENV SLOTSYNC_DATA=/data
 VOLUME ["/data"]
 
