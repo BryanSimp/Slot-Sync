@@ -1,0 +1,20 @@
+# Tool configuration only. Runtime dependencies live in requirements.txt and
+# dev-only ones in requirements-dev.txt, per PLAN.md section 12.
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    # starlette's TestClient imports a deprecated anyio alias at module scope.
+    # Not our code and not actionable here; everything else stays an error.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 90
+src = ["src", "tests", "scripts"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

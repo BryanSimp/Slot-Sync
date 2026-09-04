@@ -1,0 +1,7 @@
+# This project builds and runs in a Linux container. Keep LF in the repo and in
+# checkouts so the Dockerfile, entrypoints and fixtures are byte-identical on
+# every platform.
+* text=auto eol=lf
+
+# Memory card images are binary. Never touch them.
+*.raw binary
