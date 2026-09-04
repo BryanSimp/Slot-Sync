@@ -14,6 +14,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 
+from .memcard import Card, Save
 from .store import (
     CardSummary,
     Device,
@@ -89,6 +90,46 @@ def card_json(card: CardSummary) -> dict:
     }
 
 
+def card_format_json(card: Card) -> dict:
+    """The card as a format, rather than as a stored version."""
+    return {
+        "size_bytes": card.size_bytes,
+        "size_mbits": card.size_mbits,
+        "data_blocks": card.data_blocks,
+        "free_blocks": card.free_blocks,
+        "used_blocks": card.used_blocks,
+        "encoding": card.encoding_name,
+        "formatted_at": (
+            None if card.formatted_at is None else card.formatted_at.isoformat()
+        ),
+        "active_directory": card.active_directory,
+        "active_bat": card.active_bat,
+        # Present but non-fatal damage. A card with warnings is stored and the
+        # UI says so; see PLAN.md section 5.
+        "warnings": card.warnings,
+    }
+
+
+def save_json(save: Save) -> dict:
+    """A directory entry: the real save name, not just a filename."""
+    return {
+        "index": save.index,
+        "game_code": save.game_code,
+        "maker_code": save.maker_code,
+        "filename": save.filename,
+        "title": save.title,
+        "subtitle": save.subtitle,
+        "display_name": save.display_name,
+        "blocks": save.block_count,
+        "size_bytes": save.size_bytes,
+        "first_block": save.first_block,
+        "modified": None if save.modified is None else save.modified.isoformat(),
+        "no_copy": save.no_copy,
+        "no_move": save.no_move,
+        "copy_counter": save.copy_counter,
+    }
+
+
 def device_json(device: Device) -> dict:
     return {
         "device_id": device.device_id,
@@ -135,25 +176,23 @@ def list_cards(store: Store = Depends(get_store)) -> dict:
 
 
 @router.get("/cards/{game_id}/{slot}", dependencies=[Depends(require_token)])
-def card_detail(
-    game_id: str, slot: str, store: Store = Depends(get_store)
-) -> dict:
+def card_detail(game_id: str, slot: str, store: Store = Depends(get_store)) -> dict:
     head = _require_head(store, game_id, slot)
     history = store.history(game_id, slot)
+    card = store.inspect_version(head)
     return {
         "game_id": head.game_id,
         "slot": head.slot,
         "slot_name": head.slot_name,
         "head": version_json(head),
         "versions": len(history),
-        # M2 adds "saves": the parsed directory entries.
+        "card": card_format_json(card),
+        "saves": [save_json(s) for s in card.saves],
     }
 
 
 @router.get("/cards/{game_id}/{slot}/versions", dependencies=[Depends(require_token)])
-def card_versions(
-    game_id: str, slot: str, store: Store = Depends(get_store)
-) -> dict:
+def card_versions(game_id: str, slot: str, store: Store = Depends(get_store)) -> dict:
     history = store.history(game_id, slot)
     if not history:
         _require_head(store, game_id, slot)  # raises the 404 with a good message
@@ -215,9 +254,7 @@ async def push_card(
     if device is not None:
         store.touch_device(device, kind="dolphin")
 
-    result = store.push(
-        game_id, slot, body, parent=parent, device_id=device, note=note
-    )
+    result = store.push(game_id, slot, body, parent=parent, device_id=device, note=note)
     head = store.head(game_id, slot)
 
     return _json_response(

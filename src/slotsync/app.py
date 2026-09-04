@@ -81,9 +81,7 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ValidationError)
     async def _bad_request(request: Request, exc: ValidationError) -> JSONResponse:
-        return JSONResponse(
-            {"error": "bad_request", "detail": str(exc)}, status_code=400
-        )
+        return JSONResponse({"error": "bad_request", "detail": str(exc)}, status_code=400)
 
     @app.exception_handler(NotFoundError)
     async def _not_found(request: Request, exc: NotFoundError) -> JSONResponse:
@@ -91,9 +89,7 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(TooLargeError)
     async def _too_large(request: Request, exc: TooLargeError) -> JSONResponse:
-        return JSONResponse(
-            {"error": "too_large", "detail": str(exc)}, status_code=413
-        )
+        return JSONResponse({"error": "too_large", "detail": str(exc)}, status_code=413)
 
     @app.exception_handler(StoreError)
     async def _store(request: Request, exc: StoreError) -> JSONResponse:

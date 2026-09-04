@@ -2,7 +2,7 @@
 # dev-only ones in requirements-dev.txt, per PLAN.md section 12.
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "scripts"]
 testpaths = ["tests"]
 filterwarnings = [
     "error",

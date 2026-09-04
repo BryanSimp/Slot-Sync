@@ -128,16 +128,34 @@ Structure, in 8192-byte blocks:
 | 4 | BAT backup |
 | 5+ | Save data blocks |
 
-Valid card sizes, from GameCube hardware:
+Valid card sizes, from GameCube hardware. **This table originally listed four sizes and
+was wrong** — Dolphin accepts six, and rejecting a valid 1 MiB or 4 MiB card would mean
+refusing to back up somebody's save:
 
-| Blocks (data) | Total size | Common name |
-|---|---|---|
-| 59 | 512 KiB | Memory Card 59 |
-| 251 | 2 MiB | Memory Card 251 — **use this as the project default** |
-| 1019 | 8 MiB | Memory Card 1019 |
-| 2043 | 16 MiB | Memory Card 2043 |
+| Mbit | Blocks (data) | Total size | Common name |
+|---|---|---|---|
+| 4 | 59 | 512 KiB | Memory Card 59 |
+| 8 | 123 | 1 MiB | Memory Card 123 |
+| 16 | 251 | 2 MiB | Memory Card 251 — **use this as the project default** |
+| 32 | 507 | 4 MiB | Memory Card 507 |
+| 64 | 1019 | 8 MiB | Memory Card 1019 |
+| 128 | 2043 | 16 MiB | Memory Card 2043 |
 
 Total file size is `(data_blocks + 5) * 8192`.
+
+The verified byte-level layout now lives in [`docs/MEMCARD.md`](docs/MEMCARD.md), checked
+against Dolphin's `GCMemcard.{h,cpp}` and YAGCD chapter 12 as this section asks. Two
+findings worth carrying here:
+
+- **Where the sources disagree, Dolphin wins.** YAGCD places the directory update counter
+  and checksums at `0x0ffa`/`0x0ffc`/`0x0ffe`, which is impossible: 127 entries of `0x40`
+  run to `0x1fc0`, so `0x0ffa` lands inside entry 63. Dolphin's `0x1ffa`/`0x1ffc`/`0x1ffe`
+  is the only arithmetic that fills the block exactly. Dolphin's source separately notes
+  YAGCD is wrong about the banner/icon flag byte.
+- **The directory and BAT checksum ranges are mirror images**, which is exactly the detail
+  that gets written backwards from memory. The directory keeps its checksums at the *end*
+  of its block and covers everything before them (`[0x0000, 0x1FFC)`); the BAT keeps its
+  checksums at the *start* and covers everything after them (`[0x0004, 0x2000)`).
 
 ### Rules that follow from this
 
@@ -153,10 +171,21 @@ Total file size is `(data_blocks + 5) * 8192`.
 
 ### Validation on ingest
 
-Reject a card if: size is not one of the four valid totals; header checksum fails;
+Reject a card if: size is not one of the six valid totals; header checksum fails;
 **both** directory copies fail checksum; **both** BAT copies fail checksum. Accept and
 flag (do not reject) if exactly one copy of a pair is bad — that is a normal state the
 console repairs on next boot.
+
+**This is deliberately more permissive than Dolphin**, which counts corrupt blocks across
+all four of dir[0], dir[1], bat[0], bat[1] and fails the card at two or more — so one bad
+directory copy *plus* one bad BAT copy is a rejection there, even though a good copy of
+each survives. Dolphin's own source carries a TODO questioning that. Keep the per-pair
+rule: a hub that refuses an upload is a hub that loses the save, whereas storing a
+questionable card costs nothing and leaves every earlier version intact. Surface the
+warnings in the UI instead.
+
+Parsed results are recomputed on demand rather than stored. Blobs are immutable, so the
+answer cannot go stale, and a card is only parsed when someone actually looks at it.
 
 ---
 
@@ -357,8 +386,10 @@ Resolve these as you go and record the answers here.
 - [ ] Does Nintendont return control to the launching `.dol` on game exit, and does it
       preserve enough state to identify which game just ran? *This determines whether
       the wrapper syncs on exit or on next launch. Spike it before writing the client.*
-- [ ] Confirmed byte offsets for the memcard header fields, checked against Dolphin's
-      source rather than recalled
+- [x] Confirmed byte offsets for the memcard header fields, checked against Dolphin's
+      source rather than recalled. **Done** — see [`docs/MEMCARD.md`](docs/MEMCARD.md).
+      Two corrections came out of it: there are six valid card sizes, not four, and
+      YAGCD's directory checksum offsets are wrong where Dolphin's are right.
 - [ ] Does Nintendont's `GAMEID.raw` ever differ from a Dolphin-written raw of the same
       card size — padding, trailing bytes, header serial?
 - [ ] Real observed throughput of a 2 MiB push over Wii 802.11g, to size the chunk

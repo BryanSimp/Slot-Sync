@@ -23,6 +23,8 @@ from typing import Literal
 from .blobs import BlobStore, sha256_hex
 from .config import Config
 from .db import closing_connection, db_to_u64, init, u64_to_db, writing
+from .memcard import Card, MemcardError
+from .memcard import parse as parse_memcard
 
 log = logging.getLogger("slotsync.store")
 
@@ -128,9 +130,7 @@ def normalise_game_id(raw: str) -> str:
     """
     value = (raw or "").strip().strip("\x00").strip().upper()
     if not GAME_ID_RE.match(value):
-        raise ValidationError(
-            f"game_id must be 1-6 alphanumeric characters, got {raw!r}"
-        )
+        raise ValidationError(f"game_id must be 1-6 alphanumeric characters, got {raw!r}")
     return value
 
 
@@ -188,8 +188,7 @@ class Store:
         game_id, slot = normalise_game_id(game_id), normalise_slot(slot)
         with closing_connection(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT * FROM versions WHERE game_id=? AND slot=? "
-                "ORDER BY version DESC",
+                "SELECT * FROM versions WHERE game_id=? AND slot=? ORDER BY version DESC",
                 (game_id, slot),
             ).fetchall()
         return [_version_from_row(row) for row in rows]
@@ -233,6 +232,22 @@ class Store:
                 f"blob {version.sha256} is missing from the store"
             ) from None
 
+    @staticmethod
+    def inspect(data: bytes) -> Card:
+        """Parse an image, translating parser errors into a ValidationError.
+
+        Parsed results are recomputed rather than stored: blobs are immutable,
+        so the answer never goes stale, and a card is only parsed when someone
+        actually looks at it.
+        """
+        try:
+            return parse_memcard(data)
+        except MemcardError as exc:
+            raise ValidationError(str(exc)) from exc
+
+    def inspect_version(self, version: Version) -> Card:
+        return self.inspect(self.read_image(version))
+
     def list_devices(self) -> list[Device]:
         with closing_connection(self.db_path) as conn:
             rows = conn.execute(
@@ -261,6 +276,7 @@ class Store:
         device_id: int | None = None,
         note: str | None = None,
         now: int | None = None,
+        validate: bool = True,
     ) -> PushResult:
         """Commit a whole card image. See the rules at the top of this module."""
         game_id, slot = normalise_game_id(game_id), normalise_slot(slot)
@@ -273,6 +289,21 @@ class Store:
             )
         if parent < 0:
             raise ValidationError(f"parent must not be negative, got {parent}")
+
+        if validate:
+            # Validation on ingest -- PLAN.md section 5. A card that fails here
+            # is structurally not a memory card, so storing it would only mean
+            # handing corruption back to a console later.
+            card = self.inspect(data)
+            if card.warnings:
+                log.warning(
+                    "accepting a card with damage",
+                    extra={
+                        "game_id": game_id,
+                        "slot": slot,
+                        "warnings": card.warnings,
+                    },
+                )
 
         digest = sha256_hex(data)
         created_at = int(time.time()) if now is None else now
