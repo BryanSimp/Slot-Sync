@@ -206,6 +206,22 @@ CREATE TABLE versions (
 );
 ```
 
+**`device_id` is a u64 on the wire but SQLite's `INTEGER` is signed 64-bit**, so ids at
+or above 2^63 do not survive a round trip as written. Store the two's-complement
+reinterpretation and convert at the boundary (`db.u64_to_db` / `db.db_to_u64`). The
+mapping is a bijection, so primary-key lookups and equality still behave.
+
+### Version numbering
+
+Versions start at **1**. `head = 0`, and equivalently no row in `cards`, means the
+server has never seen this card. A first push therefore sends `parent_version = 0`.
+Pushing with a non-zero parent for a card the server does not have is a conflict, not a
+create: it means the client is out of step with the server.
+
+Rollback is **append-only**. Making version *v* head again writes a *new* version whose
+blob is *v*'s, rather than truncating history. That keeps a rollback undoable, which
+matters when the rollback itself was the mistake.
+
 ---
 
 ## 7. Conflict model
@@ -243,6 +259,23 @@ GET    /                                         → web UI
 ```
 
 `409 Conflict` responses must include the current head version and its SHA-256.
+
+### Settled while building M1
+
+- **`parent` is required on push and has no default.** Defaulting it to head would turn
+  every stale push into a silent overwrite, which is the failure mode in §7. A new card
+  sends `parent=0`.
+- Push also accepts optional `?device={u64}` and `?note={text}`. The Dolphin daemon uses
+  `device` so the card list can name what last wrote each card; the schema in §6 needs
+  it and no other HTTP route supplies it.
+- Status codes: `201` new version, `200` idempotent no-op (identical image),
+  `400` malformed game id / slot / parent, `401` bad token, `404` unknown card or
+  version, `409` conflict, `413` over `SLOTSYNC_MAX_CARD_BYTES`.
+- Downloads carry `ETag: "<sha256>"`, `X-SlotSync-Version`, and a
+  `Content-Disposition` filename of `GAMEID.raw` — the name Nintendont expects, so a
+  download drops straight into `/saves/`.
+- `{slot}` accepts `0`/`1` and `A`/`B`. The wire protocol speaks 0/1; humans and the web
+  UI speak A/B. Both normalise to the integer.
 
 ---
 
