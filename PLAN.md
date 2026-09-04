@@ -108,6 +108,33 @@ the payload, keyed by the pre-shared key.
   client retransmits only the gaps
 - Cap: max 64 concurrent staging buffers, max `total_size` of 16 MiB. Reject beyond that.
 
+### Settled while building M4
+
+Full detail is in [`docs/PROTOCOL.md`](docs/PROTOCOL.md); the parts that change how you
+read this section:
+
+- On the push path, **`card_version` is a transfer id the client picks** and echoes
+  through `PUSH_BEGIN`/`PUSH_CHUNK`/`PUSH_END`, because at `PUSH_BEGIN` it cannot know
+  the version it will be assigned. The assigned version comes back in the `PUSH_END` ack.
+- A repeated `PUSH_BEGIN` restarts the transfer rather than resuming it.
+- **A missing-chunk bitmap does not always fit one datagram** — a 16 MiB card needs 2048
+  bitmap bytes against a 1024-byte cap. Bitmaps are windowed, with the base chunk index
+  in the header's `sequence` field, so the payload stays exactly what this section
+  describes. Bit order is LSB-first.
+- `PULL_REQ` uses `card_version` to select a version, 0 meaning head, so a console can
+  restore an older save without the web UI.
+- A conflict `NACK` carries the head in `card_version`, so the client can pull it and
+  surface a choice.
+
+### Measured, which answers one of §13's open questions
+
+Pushing a 2 MiB card unpaced over **loopback with no injected loss** lost about a third
+of its 2048 chunks and needed four retransmission rounds. The datagrams were overrunning
+the server's socket receive buffer, not the network. Setting `SO_RCVBUF` to 4 MiB
+(`SLOTSYNC_UDP_RCVBUF`) makes the same push complete in one round with zero loss;
+client-side pacing does too, independently. Both are in place. That number is a floor for
+what real 802.11g will need, not a substitute for measuring it.
+
 ---
 
 ## 5. GameCube memory card format
@@ -414,4 +441,6 @@ Resolve these as you go and record the answers here.
 - [ ] Does Nintendont's `GAMEID.raw` ever differ from a Dolphin-written raw of the same
       card size — padding, trailing bytes, header serial?
 - [ ] Real observed throughput of a 2 MiB push over Wii 802.11g, to size the chunk
-      timeout sensibly
+      timeout sensibly. *Partly answered on loopback — see §4. The finding that mattered
+      was not throughput but buffering: an unpaced burst overruns the receive socket long
+      before it troubles the network. Still needs a real console on real WiFi.*
