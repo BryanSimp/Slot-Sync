@@ -1,0 +1,15 @@
+# The build context is uploaded to the daemon in full, and .venv alone is
+# hundreds of megabytes.
+.venv/
+venv/
+data/
+.git/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+tests/
+scripts/
+docs/
+*.raw
