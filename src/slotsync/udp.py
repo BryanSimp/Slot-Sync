@@ -42,6 +42,8 @@ from .protocol import (
     unpack,
     unpack_bitmap,
 )
+from .ratelimit import RateLimiter
+from .replay import NonceCache
 from .store import (
     ConflictError,
     NotFoundError,
@@ -115,6 +117,16 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         self._tasks: set[asyncio.Task] = set()
         self._sweeper: asyncio.Task | None = None
 
+        # Checked before the HMAC, since verifying is the expensive part and an
+        # unauthenticated flood should not get to spend it.
+        self.limiter = RateLimiter(config.udp_burst, config.udp_rate)
+        #: NACKing every dropped datagram would turn a flood into two floods,
+        #: and logging every one would turn it into a log flood. Separate
+        #: budgets, so neither starves the other.
+        self._limit_notified: dict[object, float] = {}
+        self._log_throttle: dict[object, float] = {}
+        self.nonces = NonceCache(ttl=config.nonce_ttl)
+
     # --- lifecycle --------------------------------------------------------
 
     def connection_made(self, transport) -> None:
@@ -134,6 +146,11 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
     # --- receive ----------------------------------------------------------
 
     def datagram_received(self, data: bytes, addr) -> None:
+        source = addr[0] if isinstance(addr, tuple) else addr
+        if not self.limiter.allow(source):
+            self._on_rate_limited(data, addr, source)
+            return
+
         try:
             message = unpack(data, self.key)
         except ProtocolError as exc:
@@ -142,6 +159,18 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         except Exception:
             # A malformed datagram must never take the listener down.
             log.exception("undecodable datagram", extra={"peer": _peer(addr)})
+            return
+
+        if not self.nonces.check_and_record(
+            message.device_id, message.nonce, message.msg_type
+        ):
+            # A correct client never reuses a nonce, retransmissions included --
+            # see replay.py. Dropping silently rather than replying keeps a
+            # replay flood from becoming an outbound one.
+            log.warning(
+                "dropped a replayed message",
+                extra={"peer": _peer(addr), "msg_type": int(message.msg_type)},
+            )
             return
 
         # PUSH_CHUNK is the hot path and is pure memory work, so it is handled
@@ -154,6 +183,52 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    @staticmethod
+    def _throttle(seen: dict, addr, interval: float = 1.0) -> bool:
+        """True at most once per `interval` per source.
+
+        Each caller passes its own dict. They must not share one: a burst of
+        rejected datagrams would otherwise consume the budget and suppress the
+        rate-limit NACK, leaving a throttled client with no idea why it is
+        being ignored.
+        """
+        source = addr[0] if isinstance(addr, tuple) else addr
+        now = time.monotonic()
+
+        if now - seen.get(source, 0.0) < interval:
+            return False
+
+        seen[source] = now
+        if len(seen) > 1024:
+            for key in [k for k, at in seen.items() if now - at > 60.0]:
+                del seen[key]
+        return True
+
+    def _should_log(self, addr) -> bool:
+        return self._throttle(self._log_throttle, addr)
+
+    def _on_rate_limited(self, data: bytes, addr, source) -> None:
+        """Drop a datagram from a source that is over budget.
+
+        A NACK goes back at most once a second per source: enough for a real
+        client to learn why it is being ignored, not enough to turn an inbound
+        flood into an outbound one.
+        """
+        if not self._throttle(self._limit_notified, addr):
+            return
+
+        log.warning("rate limited", extra={"peer": _peer(addr)})
+        self._send(
+            Message(
+                msg_type=MsgType.NACK,
+                device_id=0,
+                game_id="",
+                slot=0,
+                payload=bytes([Error.RATE_LIMITED]),
+            ),
+            addr,
+        )
+
     def _reject(self, data: bytes, addr, exc: ProtocolError) -> None:
         """NACK an unusable datagram.
 
@@ -163,10 +238,19 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         Answering at all is worth it: a client built with the wrong PSK is
         otherwise met with silence.
         """
-        log.warning(
-            "rejected datagram",
-            extra={"peer": _peer(addr), "code": exc.code.name, "detail": str(exc)},
-        )
+        # Log at most once a second per source. The input here is entirely
+        # attacker-controlled, so an unthrottled warning turns a datagram flood
+        # into a log flood -- which fills a disk the flood itself never could.
+        if self._should_log(addr):
+            log.warning(
+                "rejected datagram",
+                extra={"peer": _peer(addr), "code": exc.code.name, "detail": str(exc)},
+            )
+        else:
+            log.debug(
+                "rejected datagram",
+                extra={"peer": _peer(addr), "code": exc.code.name},
+            )
         sequence = 0
         if len(data) >= 48:
             with contextlib.suppress(struct.error):

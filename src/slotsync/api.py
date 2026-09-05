@@ -42,8 +42,28 @@ COOKIE_NAME = "slotsync_token"
 
 
 def token_is_valid(request: Request, presented: str) -> bool:
-    """compare_digest, so a wrong token cannot be recovered by timing."""
-    return hmac.compare_digest(presented, request.app.state.config.token)
+    """Check the token, rate-limiting wrong answers.
+
+    compare_digest, so the token cannot be recovered by timing.
+
+    The comparison happens *before* the budget is consulted, and only a wrong
+    answer costs anything. Checking the limiter first would lock out a correct
+    token too, which punishes the household member who mistyped it in the web
+    UI while doing nothing to an attacker -- who does not have the token and is
+    throttled either way. A cheap `compare_digest` is not worth protecting from
+    the way an expensive hash would be.
+    """
+    limiter = getattr(request.app.state, "auth_limiter", None)
+    client = request.client.host if request.client else "unknown"
+
+    if hmac.compare_digest(presented, request.app.state.config.token):
+        if limiter is not None:
+            limiter.reset(client)
+        return True
+
+    if limiter is not None and not limiter.allow(client):
+        raise AuthThrottled()
+    return False
 
 
 def presented_token(request: Request, authorization: str | None) -> str:
@@ -70,6 +90,10 @@ def require_token(
 
 class AuthError(Exception):
     """Missing or wrong bearer token. Translated to 401 in app.py."""
+
+
+class AuthThrottled(Exception):
+    """Too many failed authentications from one client. 429 in app.py."""
 
 
 def get_store(request: Request) -> Store:

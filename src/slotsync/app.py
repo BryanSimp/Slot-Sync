@@ -14,9 +14,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import AuthError
+from .api import AuthError, AuthThrottled
 from .api import router as api_router
 from .config import Config
+from .ratelimit import RateLimiter
 from .store import (
     ConflictError,
     NotFoundError,
@@ -60,6 +61,8 @@ def create_app(config: Config) -> FastAPI:
     )
     app.state.config = config
     app.state.store = Store(config)
+    # Failed authentications only. A correct request is never throttled.
+    app.state.auth_limiter = RateLimiter(config.auth_attempts, config.auth_refill)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -87,6 +90,17 @@ def _install_error_handlers(app: FastAPI) -> None:
             {"error": "unauthorized", "detail": "missing or invalid bearer token"},
             status_code=401,
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    @app.exception_handler(AuthThrottled)
+    async def _throttled(request: Request, exc: AuthThrottled) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": "too_many_requests",
+                "detail": "too many failed authentications; wait and retry",
+            },
+            status_code=429,
+            headers={"Retry-After": "30"},
         )
 
     @app.exception_handler(ConflictError)

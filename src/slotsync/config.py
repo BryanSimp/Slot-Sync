@@ -58,6 +58,22 @@ class Config:
     #: setsockopt. The OS may clamp this.
     udp_rcvbuf: int = 4 * 1024 * 1024
 
+    #: Per-source datagram budget. Must comfortably clear a full card's burst
+    #: -- 2048 datagrams for a 2 MiB card -- because throttling a legitimate
+    #: console is worse than the flood it would prevent.
+    udp_burst: int = 4096
+    udp_rate: float = 2048.0
+
+    #: How long a control-message nonce is remembered, for replay rejection.
+    #: Matched to the staging TTL: a transfer cannot outlive it either.
+    nonce_ttl: float = 120.0
+
+    #: Failed HTTP authentications allowed per client address before the
+    #: limiter starts refusing. A shared token on a LAN should not be
+    #: brute-forceable.
+    auth_attempts: int = 10
+    auth_refill: float = 0.2
+
     @property
     def blobs_dir(self) -> Path:
         return self.data_dir / "blobs"
@@ -94,6 +110,11 @@ class Config:
             pull_burst=_int(src, "SLOTSYNC_PULL_BURST", 32),
             pull_burst_delay=_float(src, "SLOTSYNC_PULL_BURST_DELAY", 0.002),
             udp_rcvbuf=_int(src, "SLOTSYNC_UDP_RCVBUF", 4 * 1024 * 1024),
+            udp_burst=_int(src, "SLOTSYNC_UDP_BURST", 4096),
+            udp_rate=_float(src, "SLOTSYNC_UDP_RATE", 2048.0),
+            nonce_ttl=_float(src, "SLOTSYNC_NONCE_TTL", 120.0),
+            auth_attempts=_int(src, "SLOTSYNC_AUTH_ATTEMPTS", 10),
+            auth_refill=_float(src, "SLOTSYNC_AUTH_REFILL", 0.2),
         )
 
 

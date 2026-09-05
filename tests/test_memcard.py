@@ -301,7 +301,7 @@ def test_directory_entry_pointing_off_the_card_is_skipped_with_a_warning():
     )
 
     parsed = parse(bytes(image))
-    assert any("points outside the card" in w for w in parsed.warnings)
+    assert any("does not fit the card" in w for w in parsed.warnings)
     assert len(parsed.saves) == 2
 
 
