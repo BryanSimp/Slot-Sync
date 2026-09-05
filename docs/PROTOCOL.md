@@ -188,3 +188,54 @@ Two fixes, both applied:
 
 The server paces its own pull the same way, 32 chunks per burst with a 2 ms gap
 (`SLOTSYNC_PULL_BURST`, `SLOTSYNC_PULL_BURST_DELAY`).
+
+---
+
+# Hardening (M5)
+
+## A control message needs a fresh nonce every time
+
+The server remembers recently seen nonces per device and drops a repeat. This applies to
+**`HELLO`, `PULL_REQ`, `PUSH_BEGIN` and `PUSH_END` only**.
+
+So a client must generate a new nonce for every control datagram it sends, **including
+retransmissions**. Resending a `PUSH_END` verbatim after a lost ACK will be dropped as a
+replay. The counter-plus-boot-entropy scheme suggested above satisfies this for free.
+
+`PUSH_CHUNK` is deliberately **not** covered, for two reasons:
+
+- Duplicate chunks are an explicitly supported operation (§4: "duplicates overwrite
+  idempotently"). Rejecting a repeat would break the retransmission path the protocol
+  depends on.
+- A kernel client resending a gap may well resend the datagram it already built, byte for
+  byte, rather than rebuilding it. Requiring a fresh nonce per chunk would make the cheap
+  implementation the broken one.
+
+Chunks are also the only high-volume message; tracking 2048 nonces per transfer to guard
+an operation that is idempotent anyway would buy nothing.
+
+## Rate limiting
+
+A per-source token bucket, checked **before** the HMAC is verified — verifying is the
+expensive part, and an unauthenticated flood should not get to spend it. The budget
+(`SLOTSYNC_UDP_BURST`, `SLOTSYNC_UDP_RATE`) has to clear a whole card's burst: throttling
+a real console is worse than the flood it would prevent.
+
+Over-budget datagrams are dropped. A `NACK 0x0A` goes back at most once per second per
+source, so an inbound flood cannot become an outbound one. Rejection logging is throttled
+separately and at the same rate — sharing one budget between the two would let a burst of
+malformed datagrams suppress the rate-limit NACK, leaving a throttled client with no idea
+why it was being ignored.
+
+## Caps
+
+| Limit | Default | Setting |
+|---|---|---|
+| Datagram | 1120 bytes (96 header + 1024 payload) | fixed by the protocol |
+| Card image | 16 MiB | `SLOTSYNC_MAX_CARD_BYTES` |
+| Pushes in flight | 64 | `SLOTSYNC_MAX_STAGING` |
+| Staging lifetime | 120 s without a chunk | `SLOTSYNC_STAGING_TTL` |
+| Nonces remembered | 512 per device, 64 devices, 120 s | `SLOTSYNC_NONCE_TTL` |
+
+An oversized `PUSH_BEGIN` is refused before a buffer is allocated, so `total_size` is
+never a lever on server memory.

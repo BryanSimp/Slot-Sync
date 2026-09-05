@@ -399,6 +399,30 @@ Rate limiting, size caps, staging expiry, replay protection on the nonce, fuzz t
 memcard parser against malformed input.
 *Done when:* the fuzz run is clean and no malformed datagram can crash the listener.
 
+Settled while building it, detail in [`docs/PROTOCOL.md`](docs/PROTOCOL.md):
+
+- **Replay protection covers control messages only** — `HELLO`, `PULL_REQ`,
+  `PUSH_BEGIN`, `PUSH_END`. `PUSH_CHUNK` is deliberately exempt: §4 makes duplicate
+  chunks a supported operation, and a kernel client may resend a built datagram byte for
+  byte rather than rebuilding it, so rejecting repeats would break the retransmission
+  path. In exchange, a control message must carry a **fresh nonce on every send,
+  retransmissions included**.
+- The UDP rate limit is checked **before** the HMAC, because verifying is the expensive
+  part. Its budget must clear a whole card's burst — throttling a real console is worse
+  than the flood it would prevent.
+- Rejection logging is throttled too. Attacker-controlled input driving unbounded
+  logging fills a disk the flood itself never could. Logging and NACKing keep *separate*
+  budgets: sharing one let a burst of malformed datagrams suppress the rate-limit NACK.
+- HTTP rate limiting applies to **failed authentications only**, so the shared token is
+  not brute-forceable and correct requests are never throttled.
+
+**The fuzzer found a real bug**, which is the argument for having written it: a directory
+entry may claim a `block_count` larger than the entire card, and the parser reported it —
+a 512 KiB card could list a 491 MiB save, and that number reached the web UI. Blocks are
+chained rather than contiguous, so `first_block + block_count` is not an extent and
+cannot be validated as one; what must hold is that a save occupies no more blocks than
+the card has. Now enforced, and the entry is skipped with a warning.
+
 ---
 
 ## 11. Non-goals

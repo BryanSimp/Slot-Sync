@@ -352,9 +352,19 @@ def _parse_directory(
         first_block, block_count = struct.unpack_from(">HH", entry, 0x36)
         block_max = FST_BLOCKS + data_blocks
 
-        if block_count == 0xFFFF or first_block < FST_BLOCKS or first_block >= block_max:
+        # `block_count` is bounded by the card, not just by 0xFFFF. Blocks are
+        # chained rather than contiguous, so `first_block + block_count` says
+        # nothing -- but a save still cannot occupy more blocks than the card
+        # has. Without this an entry claiming 60000 blocks on a 64-block card
+        # is reported as a 491 MiB save, which then reaches the web UI.
+        if (
+            block_count == 0xFFFF
+            or not 1 <= block_count <= data_blocks
+            or first_block < FST_BLOCKS
+            or first_block >= block_max
+        ):
             warnings.append(
-                f"directory entry {index} ({_ascii(game_code)}) points outside "
+                f"directory entry {index} ({_ascii(game_code)}) does not fit "
                 f"the card and was skipped"
             )
             continue
