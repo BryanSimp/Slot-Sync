@@ -480,6 +480,21 @@ UDP protocol into `/saves/`, chainloads Nintendont, and pushes on return.
 server. **Running it needs real hardware**, so building and a protocol round-trip are as
 far as this can be verified here.
 
+Split into `wii/core/` (protocol, no libogc, no allocation) and `wii/source/` (console).
+The core reaches the network through two function pointers, so the same code runs on
+libogc and on BSD sockets — which is what lets the protocol be tested against a live
+server with no console, and is also what makes it the piece that moves into the ARM
+kernel for phase 2.
+
+**A cheap head query fell out of the existing protocol**: a `PULL_REQ` whose payload is
+an all-zero bitmap asks for no chunks, and the server still acks with the card's version
+and size. "Is the server ahead of me?" costs two datagrams instead of two thousand, with
+no new message type.
+
+Blocked on one toolchain gap, not on code: `libfat` is not part of libogc and is missing
+from this machine's install, so `main.c` cannot be compiled until
+`dkp-pacman -S libfat-ogc` is run. Every other source file compiles clean for PowerPC.
+
 **M8 — Wiring**
 One compose file, one shared secret set, matching card sizes, and an end-to-end walk
 through: push from the PC, pull on the console, play, push back, see both versions in the

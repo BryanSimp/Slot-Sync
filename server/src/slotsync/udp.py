@@ -24,6 +24,7 @@ import hashlib
 import logging
 import socket
 import struct
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -133,7 +134,23 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         self.transport = transport
         self._sweeper = asyncio.create_task(self._sweep_forever())
 
+    def error_received(self, exc: Exception) -> None:
+        """A datagram-level error, most often an ICMP port-unreachable.
+
+        Implementing this is not optional in practice. The server streams a
+        whole card as thousands of datagrams; if the client stops listening
+        part-way -- a console powered off mid-pull -- the OS reports the
+        unreachable port back on this socket. Without a handler asyncio can
+        treat that as fatal and tear the transport down, which leaves the
+        process alive and answering HTTP while the UDP listener is silently
+        dead. Logging and carrying on is the correct response: one peer going
+        away is not a reason to stop serving every other console.
+        """
+        log.warning("datagram error, continuing", extra={"detail": str(exc)})
+
     def connection_lost(self, exc) -> None:
+        if exc is not None:
+            log.error("udp listener lost its transport", extra={"detail": str(exc)})
         if self._sweeper is not None:
             self._sweeper.cancel()
         for task in list(self._tasks):
@@ -612,6 +629,17 @@ async def start_listener(
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, config.udp_rcvbuf)
             actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
+        if sys.platform == "win32":
+            # Windows reports an ICMP port-unreachable from a previous sendto as
+            # an error on the *next* receive, which is not how UDP is supposed
+            # to behave for an unconnected socket and can knock the listener
+            # over when a console disappears mid-pull. SIO_UDP_CONNRESET turns
+            # that off. Deployment is Linux in Docker, where the behaviour does
+            # not arise, but people develop against this on Windows.
+            SIO_UDP_CONNRESET = 0x9800000C
+            with contextlib.suppress(OSError, AttributeError):
+                sock.ioctl(SIO_UDP_CONNRESET, False)
     log.info(
         "udp listener bound",
         extra={

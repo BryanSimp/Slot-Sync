@@ -17,8 +17,8 @@ Three parts, one repo, a directory each.
 | Directory | What it does | Status |
 |---|---|---|
 | [`server/`](server/) | Docker hub: storage, versioning, web UI, both ingest protocols | M0–M5 done |
-| [`dolphin/`](dolphin/) | PC daemon: manages per-game cards, syncs over HTTP | In progress |
-| [`wii/`](wii/) | Homebrew launcher: pulls saves, chainloads Nintendont, pushes on exit | In progress |
+| [`dolphin/`](dolphin/) | PC daemon: manages per-game cards, syncs over HTTP | M6 done |
+| [`wii/`](wii/) | Homebrew launcher: pulls saves, chainloads Nintendont, pushes on exit | M7 — builds, needs `libfat-ogc` |
 
 `docs/` is shared: [`PROTOCOL.md`](docs/PROTOCOL.md) is the wire format all three speak,
 [`MEMCARD.md`](docs/MEMCARD.md) the card layout.

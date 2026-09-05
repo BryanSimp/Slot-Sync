@@ -1,0 +1,6 @@
+build/
+boot.elf
+boot.dol
+*.map
+tests/test_core
+tests/test_core.exe

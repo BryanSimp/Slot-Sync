@@ -1,0 +1,26 @@
+# SlotSync for Wii -- copy to sd:/slotsync/slotsync.cfg and edit.
+
+# The server's address. A dotted quad, not a hostname: there is no DNS on the
+# console ingest path, deliberately (PLAN.md section 2).
+server     = 192.168.1.10
+port       = 9977
+
+# Must match SLOTSYNC_PSK on the server exactly. A mismatch shows up as
+# "bad hmac" rather than as a connection failure.
+psk        = changeme
+
+# Identifies this console in the server's version history. Any u64; give each
+# console in the house a different one.
+device_id  = 0x5749490000000001
+
+# Where Nintendont keeps its cards, and what to launch when the sync is done.
+saves_dir  = sd:/saves
+nintendont = sd:/apps/Nintendont/boot.dol
+
+# 1 to launch Nintendont as soon as the sync finishes, 0 to wait for a button
+# so you can read the log.
+autoboot   = 1
+
+# Per-reply timeout and how many retransmission rounds before giving up.
+timeout_ms = 2000
+rounds     = 12

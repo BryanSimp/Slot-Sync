@@ -562,3 +562,24 @@ def test_fake_console_survives_loss_and_reordering(udp_config, tmp_path):
 
     _run_real(udp_config, work)
     assert out.read_bytes() == CARD
+
+
+def test_a_datagram_error_does_not_stop_the_listener(server, caplog):
+    """One peer going away -- a console powered off mid-pull -- must not take
+    the listener down for every other console. Without an error_received the
+    transport can be torn down, leaving the process answering HTTP while UDP is
+    silently dead."""
+    with caplog.at_level("WARNING", logger="slotsync.udp"):
+        server.error_received(ConnectionResetError("port unreachable"))
+
+    assert any("continuing" in r.message for r in caplog.records)
+
+    # Still serving.
+    run(deliver(server, pack(Message(MsgType.HEARTBEAT, 1, "GALE01", 0), TEST_PSK)))
+    assert drain(server)[-1].msg_type == MsgType.ACK
+
+
+def test_losing_the_transport_is_logged_loudly(server, caplog):
+    with caplog.at_level("ERROR", logger="slotsync.udp"):
+        server.connection_lost(OSError("gone"))
+    assert any("lost its transport" in r.message for r in caplog.records)

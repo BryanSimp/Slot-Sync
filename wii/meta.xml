@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<app version="1">
+  <name>SlotSync</name>
+  <coder>SlotSync</coder>
+  <version>0.1.0</version>
+  <short_description>Sync GameCube saves, then launch Nintendont</short_description>
+  <long_description>Syncs the memory cards in /saves with a SlotSync server over the local network, then chainloads Nintendont. Configure it in sd:/slotsync/slotsync.cfg.</long_description>
+</app>
