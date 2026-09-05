@@ -514,3 +514,91 @@ def _ostime(ticks: int) -> dt.datetime | None:
         return GC_EPOCH + dt.timedelta(seconds=ticks / 40_500_000)
     except (OverflowError, OSError):
         return None
+
+
+# --- formatting -----------------------------------------------------------
+
+
+def format_card(
+    *,
+    mbit: int = DEFAULT_MBIT,
+    encoding: int = 0,
+    device_id: int = 0,
+    serial: bytes | None = None,
+    format_time: int = 0,
+) -> bytes:
+    """Build a blank, formatted card image.
+
+    Needed because the two sides disagree about what a card is (PLAN.md §5):
+    the PC daemon uses one card per game, so a game the server has never seen
+    needs an empty card made for it. Card-format knowledge lives here, with the
+    verified parser, rather than being duplicated into every client.
+
+    Values follow Dolphin's `Header`, `Directory` and `BlockAlloc` constructors:
+    header and directory blocks are 0xFF-filled, the BAT is zero-filled because
+    0 means "free", and `last_allocated_block` starts at 4 -- the last of the
+    five reserved blocks.
+
+    On the card serial: it seeds the encryption some games apply to their saves.
+    A synthetic one is safe here precisely because SlotSync moves whole cards --
+    the serial travels with the image, so a save is always read back against the
+    serial it was written under. That would not hold if we moved individual
+    saves between cards, which is a further reason not to.
+    """
+    if mbit not in VALID_MBIT:
+        raise MemcardError(
+            f"{mbit} Mbit is not a real card size; expected one of {VALID_MBIT}"
+        )
+    if encoding not in ENCODING_NAMES:
+        raise MemcardError(
+            f"encoding must be 0 (cp1252) or 1 (shift_jis), got {encoding}"
+        )
+
+    total_blocks = mbit * MBIT_TO_BLOCKS
+    data_blocks = total_blocks - FST_BLOCKS
+
+    # --- header -----------------------------------------------------------
+    header = bytearray(b"\xff" * BLOCK_SIZE)
+    header[0x0000:0x000C] = (serial or bytes(12))[:12].ljust(12, b"\x00")
+    struct.pack_into(">Q", header, 0x000C, format_time)
+    struct.pack_into(">I", header, 0x0014, 0)  # sram bias
+    struct.pack_into(">I", header, 0x0018, 0)  # sram language
+    struct.pack_into(">I", header, 0x001C, 0)  # dtv status
+    struct.pack_into(">H", header, 0x0020, device_id)
+    struct.pack_into(">H", header, 0x0022, mbit)
+    struct.pack_into(">H", header, 0x0024, encoding)
+    struct.pack_into(">H", header, 0x01FA, 0)  # update counter
+    struct.pack_into(
+        ">HH",
+        header,
+        HEADER_CHECKSUM_OFF,
+        *checksums(bytes(header[:HEADER_CHECKSUM_OFF])),
+    )
+
+    # --- directory: every entry unused, which is game code 0xFFFFFFFF ------
+    directory = bytearray(b"\xff" * BLOCK_SIZE)
+    struct.pack_into(">h", directory, DIR_UPDATE_COUNTER_OFF, 0)
+    struct.pack_into(
+        ">HH",
+        directory,
+        DIR_CHECKSUM_OFF,
+        *checksums(bytes(directory[:DIR_CHECKSUM_OFF])),
+    )
+
+    # --- block allocation table: zeroed, since 0 means free ----------------
+    bat = bytearray(BLOCK_SIZE)
+    struct.pack_into(">h", bat, BAT_UPDATE_COUNTER_OFF, 0)
+    struct.pack_into(">H", bat, 0x0006, data_blocks)  # free blocks
+    struct.pack_into(">H", bat, 0x0008, FST_BLOCKS - 1)  # last allocated
+    struct.pack_into(
+        ">HH", bat, BAT_CHECKSUM_OFF, *checksums(bytes(bat[BAT_UPDATE_COUNTER_OFF:]))
+    )
+
+    return bytes(
+        header
+        + directory
+        + directory  # backup copy
+        + bat
+        + bat  # backup copy
+        + b"\xff" * (data_blocks * BLOCK_SIZE)
+    )

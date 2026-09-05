@@ -236,3 +236,47 @@ def test_oversized_body_is_413(client, config):
 def test_non_numeric_version_is_400(client):
     push(client, CARD_A)
     assert client.get("/api/cards/GALE01/A/nope.raw", headers=AUTH).status_code == 400
+
+
+# --- formatting a new card ------------------------------------------------
+
+
+def test_format_creates_a_blank_card_for_an_unseen_game(client):
+    """The PC side keeps one card per game, so a game with no history needs an
+    empty card made before it can be played."""
+    response = client.post("/api/cards/GALE01/A/format", params={"mbit": 4}, headers=AUTH)
+
+    assert response.status_code == 201
+    assert response.json()["version"] == 1
+    assert response.json()["mbit"] == 4
+
+    detail = client.get("/api/cards/GALE01/A", headers=AUTH).json()
+    assert detail["saves"] == []
+    assert detail["card"]["free_blocks"] == detail["card"]["data_blocks"]
+
+
+def test_a_formatted_card_downloads_as_a_valid_image(client):
+    client.post("/api/cards/GALE01/A/format", headers=AUTH)
+    image = client.get("/api/cards/GALE01/A/latest.raw", headers=AUTH).content
+    assert len(image) == 2 * 1024 * 1024  # the 16 Mbit default
+
+
+def test_format_refuses_to_overwrite_an_existing_card(client):
+    """History would survive it, but silently blanking a card is surprising."""
+    push(client, CARD_A)
+    response = client.post("/api/cards/GALE01/A/format", headers=AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["head"] == 1
+    assert client.get("/api/cards/GALE01/A/latest.raw", headers=AUTH).content == CARD_A
+
+
+def test_format_rejects_a_size_no_hardware_produces(client):
+    response = client.post(
+        "/api/cards/GALE01/A/format", params={"mbit": 12}, headers=AUTH
+    )
+    assert response.status_code == 400
+
+
+def test_format_requires_auth(client):
+    assert client.post("/api/cards/GALE01/A/format").status_code == 401

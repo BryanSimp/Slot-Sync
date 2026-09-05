@@ -1,0 +1,25 @@
+[project]
+name = "slotsync-dolphin"
+version = "0.1.0"
+description = "Sync Dolphin's GameCube memory cards with a SlotSync server"
+requires-python = ">=3.12"
+# No runtime dependencies, on purpose. See src/slotsync_dolphin/__init__.py.
+dependencies = []
+
+[project.scripts]
+slotsync-dolphin = "slotsync_dolphin.cli:main"
+
+[tool.pytest.ini_options]
+# The server and its fixture generator are importable so the integration
+# tests can run the real hub rather than a mock of it.
+pythonpath = ["src", "../server/src", "../server/scripts"]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 90
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

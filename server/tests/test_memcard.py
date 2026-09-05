@@ -23,6 +23,7 @@ from slotsync.memcard import (
     bat_checksum_ok,
     checksums,
     directory_checksum_ok,
+    format_card,
     header_checksum_ok,
     parse,
 )
@@ -337,3 +338,64 @@ def test_update_counters_are_compared_as_signed_values():
     )
     # Unsigned this would be 65535 and would win; signed it is -1 and loses.
     assert parse(bytes(image)).active_directory == 0
+
+
+# --- formatting -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("mbit", VALID_MBIT)
+def test_a_formatted_card_parses_back_clean(mbit):
+    """The daemon needs blank cards for games the server has never seen."""
+    card = parse(format_card(mbit=mbit))
+
+    assert card.size_mbits == mbit
+    assert card.saves == []
+    assert card.warnings == []
+    assert card.free_blocks == card.data_blocks
+
+
+def test_a_formatted_card_matches_dolphins_empty_directory_checksum():
+    """Dolphin hardcodes the empty directory's checksum as 0xF003 rather than
+    computing it. Reproducing that constant checks our checksum routine against
+    an independent source."""
+    image = format_card()
+    directory = image[BLOCK_SIZE : 2 * BLOCK_SIZE]
+
+    assert struct.unpack_from(">HH", directory, 0x1FFC) == (0xF003, 0)
+    assert directory_checksum_ok(directory)
+
+
+def test_a_formatted_cards_bat_matches_dolphins_constructor():
+    """memset(0), free = MbitToFreeBlocks, last_allocated = 4."""
+    image = format_card(mbit=16)
+    bat = image[3 * BLOCK_SIZE : 4 * BLOCK_SIZE]
+
+    assert struct.unpack_from(">H", bat, 0x0006)[0] == 251  # free blocks
+    assert struct.unpack_from(">H", bat, 0x0008)[0] == 4  # last allocated
+    assert bat_checksum_ok(bat)
+    assert not any(bat[0x000A:])  # the whole map is free
+
+
+def test_both_copies_of_the_directory_and_bat_are_written():
+    image = format_card()
+    assert image[BLOCK_SIZE : 2 * BLOCK_SIZE] == image[2 * BLOCK_SIZE : 3 * BLOCK_SIZE]
+    assert (
+        image[3 * BLOCK_SIZE : 4 * BLOCK_SIZE] == image[4 * BLOCK_SIZE : 5 * BLOCK_SIZE]
+    )
+
+
+def test_formatting_records_the_declared_size_and_encoding():
+    card = parse(format_card(mbit=32, encoding=1))
+    assert card.size_mbits == 32
+    assert card.is_shift_jis
+
+
+@pytest.mark.parametrize("mbit", [0, 1, 12, 256])
+def test_formatting_refuses_a_size_no_hardware_produces(mbit):
+    with pytest.raises(MemcardError):
+        format_card(mbit=mbit)
+
+
+def test_formatting_refuses_an_unknown_encoding():
+    with pytest.raises(MemcardError):
+        format_card(encoding=7)

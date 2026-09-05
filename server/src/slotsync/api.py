@@ -14,9 +14,10 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 
-from .memcard import Card, Save
+from .memcard import DEFAULT_MBIT, Card, MemcardError, Save, format_card
 from .store import (
     CardSummary,
+    ConflictError,
     Device,
     NotFoundError,
     Store,
@@ -333,6 +334,51 @@ def rollback_card(
         "restored_from": version,
         "sha256": head.sha256,
     }
+
+
+@router.post("/cards/{game_id}/{slot}/format", dependencies=[Depends(require_token)])
+def format_card_endpoint(
+    game_id: str,
+    slot: str,
+    mbit: int = Query(default=DEFAULT_MBIT, description="Card size; 16 is the default."),
+    device: int | None = Query(default=None),
+    store: Store = Depends(get_store),
+) -> Response:
+    """Create a blank formatted card for a game the server has never seen.
+
+    The PC side keeps one card per game (PLAN.md section 5), so a game with no
+    history needs an empty card made before it can be played. Card-format
+    knowledge stays here with the verified parser rather than being duplicated
+    into every client.
+
+    Refuses if a card already exists: overwriting one would be surprising even
+    though history would survive it.
+    """
+    existing = store.head(game_id, slot)
+    if existing is not None:
+        raise ConflictError(existing.version, existing.sha256)
+
+    try:
+        image = format_card(mbit=mbit)
+    except MemcardError as exc:
+        raise ValidationError(str(exc)) from exc
+
+    result = store.push(
+        game_id, slot, image, parent=0, device_id=device, note=f"formatted {mbit} Mbit"
+    )
+    head = store.head(game_id, slot)
+    return _json_response(
+        {
+            "game_id": head.game_id,
+            "slot": head.slot,
+            "version": result.version,
+            "outcome": result.outcome,
+            "sha256": head.sha256,
+            "size": head.size,
+            "mbit": mbit,
+        },
+        status_code=201,
+    )
 
 
 @router.get("/devices", dependencies=[Depends(require_token)])
