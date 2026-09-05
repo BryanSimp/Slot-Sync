@@ -500,7 +500,10 @@ One compose file, one shared secret set, matching card sizes, and an end-to-end 
 through: push from the PC, pull on the console, play, push back, see both versions in the
 web UI.
 *Done when:* that walk-through is written down and every step it names has been executed
-somewhere.
+somewhere. **Done** — it is in the README, and the run behind it was: the daemon
+formatting a blank card, the PC pushing a save over HTTP as v2, the console pulling those
+exact bytes over UDP, the console pushing v3, and the PC pulling that back byte-identical.
+Both transports, one lineage, `parent` chaining correctly through all three.
 
 ### Open question that gates M7
 

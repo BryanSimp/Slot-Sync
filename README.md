@@ -71,6 +71,46 @@ Two things to know:
 - Test fixtures are synthetic, from `scripts/make_fixture.py`. A real Nintendont
   `.raw` in `tests/fixtures/` is still what would settle the parser.
 
+## The whole cycle, end to end
+
+This is the walkthrough from `PLAN.md` §10b M8, and every step below has been run.
+
+**On the server** — `docker compose up -d`, with `SLOTSYNC_TOKEN` and `SLOTSYNC_PSK`
+set in `.env`. Both clients need those two values and nothing else.
+
+**On the PC**
+
+```bash
+python -m slotsync_dolphin setup --server http://your-nas:8080 --token "$SLOTSYNC_TOKEN"
+python -m slotsync_dolphin play GALE01 --exec ~/games/windwaker.iso
+```
+
+`play` pulls the card, repoints Dolphin's `MemcardAPath` at it, launches, waits, and
+pushes when you quit. A game the server has never seen gets a blank card formatted for
+it first.
+
+**On the console** — put `boot.dol` in `sd:/apps/slotsync/`, write
+`sd:/slotsync/slotsync.cfg` with the server address and the PSK, and launch it from the
+Homebrew Channel. It syncs every card in `/saves` and then chainloads Nintendont.
+
+**What you get**
+
+```
+GALE01 slot A, head v3
+  v3  parent=2    f9fd9037c6  console (UDP)
+  v2  parent=1    87e6eaaf72  dolphin (HTTP)
+  v1  parent=None a0411e0a19  formatted 16 Mbit
+```
+
+A save written on the PC arrives on the console byte-identical, and vice versa. The web
+UI at `http://localhost:8080` shows that history with real save names parsed out of the
+card, a download button per version, and a restore button.
+
+**When both sides moved**, the second push is refused rather than merged: the console
+prints the conflict on screen, `slotsync-dolphin` exits with status 3, and neither save
+is touched. You pick in the web UI. That is the whole point of the project — see
+[`PLAN.md`](PLAN.md) §7.
+
 ## Trying it without Docker
 
 ```bash
