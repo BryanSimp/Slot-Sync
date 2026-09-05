@@ -14,11 +14,17 @@ SlotSync syncs GameCube memory card saves between three places:
 2. **Dolphin** on a PC, which reads the same raw memory card format
 3. **This server**, the hub, running in Docker
 
-The wider project has three clients. **This repo is the hub only.** Two clients live
-elsewhere and are out of scope here, but their constraints shape every decision below:
+The wider project has three parts. **They now live in this one repo**, a directory each:
 
-- **Homebrew wrapper** (Wii, libogc): pulls saves at launch, chainloads Nintendont, pushes on exit
-- **Dolphin daemon** (PC, any language): watches the memcard directory, pushes on change
+| Directory | Part |
+|---|---|
+| `server/` | The Docker hub. Storage, versioning, web UI, both ingest protocols. |
+| `dolphin/` | PC daemon. Manages per-game cards and syncs over HTTP. |
+| `wii/` | Homebrew wrapper, libogc. Pulls at launch, chainloads Nintendont, pushes on exit. |
+
+*Changed from the original plan, which put the two clients in separate repos.* One repo
+keeps the wire protocol in lockstep across three implementations of it, which is the
+thing most likely to drift. `docs/` stays at the root because all three parts read it.
 
 There is a **phase 2** for the console client: moving the push logic from the libogc
 wrapper into Nintendont's ARM kernel so saves sync mid-game. The server must be ready
@@ -183,6 +189,38 @@ findings worth carrying here:
   that gets written backwards from memory. The directory keeps its checksums at the *end*
   of its block and covers everything before them (`[0x0000, 0x1FFC)`); the BAT keeps its
   checksums at the *start* and covers everything after them (`[0x0004, 0x2000)`).
+
+### The two card models, and why the PC side has to change
+
+**Nintendont and Dolphin do not organise cards the same way, and the original plan
+assumed they did.**
+
+- Nintendont writes `/saves/GAMEID.raw` — one whole card image **per game**.
+- Dolphin uses one shared card per region and slot, e.g.
+  `Dolphin Emulator/GC/MemoryCardA.USA.raw`, holding **every** game's saves at once.
+  Its path is `MemcardAPath` under `[Core]` in `Dolphin.ini`, and `SlotA = 8` selects a
+  card file (`9` would select GCI-folder mode).
+
+A card observed on a real install: 16 MiB, 2043 blocks, 43 of them used by one Pokémon XD
+save, the other 2000 free — with everything else that machine ever played on the same
+image.
+
+So a Wind Waker save cannot move between console and PC by copying whole cards, because
+the two sides disagree about what a card *is*. Three ways out, and only one is allowed:
+
+1. **Make Dolphin use per-game cards too.** The daemon keeps a directory of
+   `GAMEID.raw` files and repoints `MemcardAPath` at the right one before a game runs.
+   Both sides then speak the same unit, and sync stays byte-exact raw-to-raw. **This is
+   the approach.**
+2. Sync Dolphin's shared card as its own card. Simple, and useless: console and PC saves
+   would never meet, which is the entire point of the project.
+3. Extract and insert individual saves into the shared card. This is the byte-level card
+   surgery §5 forbids and the reason §11 rejects `.gci`. Not doing it.
+
+The cost of (1) is real and worth stating: **Dolphin has to be launched in a way that
+lets the daemon set the card first.** That is what `dolphin/` provides. It is not
+"seamless" in the sense of requiring nothing — it is seamless in the sense that one
+command does the pull, the launch and the push.
 
 ### Rules that follow from this
 
@@ -424,6 +462,38 @@ cannot be validated as one; what must hold is that a save occupies no more block
 the card has. Now enforced, and the entry is skipped with a warning.
 
 ---
+
+## 10b. Client milestones
+
+M0–M5 built the hub. These build the two clients and wire the three parts together.
+
+**M6 — Dolphin daemon (`dolphin/`)**
+Per-game card directory, HTTP sync, and a `play` command that pulls, launches Dolphin,
+waits, and pushes. Reads `MemcardAPath` out of `Dolphin.ini` and repoints it.
+*Done when:* `slotsync-dolphin play GALE01` round-trips a save through the server, and a
+conflict surfaces as a refusal rather than an overwrite.
+
+**M7 — Wii homebrew wrapper (`wii/`)**
+libogc `.dol` that reads its config from the SD card, pulls `GAMEID.raw` over the binary
+UDP protocol into `/saves/`, chainloads Nintendont, and pushes on return.
+*Done when:* it builds with devkitPPC and completes a pull/push round-trip against the
+server. **Running it needs real hardware**, so building and a protocol round-trip are as
+far as this can be verified here.
+
+**M8 — Wiring**
+One compose file, one shared secret set, matching card sizes, and an end-to-end walk
+through: push from the PC, pull on the console, play, push back, see both versions in the
+web UI.
+*Done when:* that walk-through is written down and every step it names has been executed
+somewhere.
+
+### Open question that gates M7
+
+PLAN §13's first open question — whether Nintendont returns control to the launching
+`.dol` on exit — decides whether the wrapper pushes **on exit** or **on next launch**.
+The wrapper is written so that either works: it pushes whatever is in `/saves/` that is
+newer than what it pulled, at startup, *and* on return if it gets control back. That
+turns an unknown into a degraded mode rather than a blocker.
 
 ## 11. Non-goals
 

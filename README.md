@@ -12,17 +12,33 @@ serves it all over a small web UI.
 
 ## Project layout
 
-SlotSync has three parts. They live in separate repos.
+Three parts, one repo, a directory each.
 
-| Part | What it does | Status |
+| Directory | What it does | Status |
 |---|---|---|
-| **slotsync** (this repo) | Docker hub: storage, versioning, web UI, both ingest protocols | M0–M5 done |
-| **slotsync-wii** | Homebrew launcher: pulls saves, chainloads Nintendont, pushes on exit | Not started |
-| **slotsync-dolphin** | PC daemon: watches Dolphin's memcard directory, syncs on change | Not started |
+| [`server/`](server/) | Docker hub: storage, versioning, web UI, both ingest protocols | M0–M5 done |
+| [`dolphin/`](dolphin/) | PC daemon: manages per-game cards, syncs over HTTP | In progress |
+| [`wii/`](wii/) | Homebrew launcher: pulls saves, chainloads Nintendont, pushes on exit | In progress |
+
+`docs/` is shared: [`PROTOCOL.md`](docs/PROTOCOL.md) is the wire format all three speak,
+[`MEMCARD.md`](docs/MEMCARD.md) the card layout.
 
 Later, the push logic moves from the Wii launcher into a Nintendont fork so saves sync
 *during* gameplay rather than only at exit. The server's binary protocol is designed for
 that client from the start.
+
+## The one thing that surprised us
+
+Nintendont and Dolphin disagree about what a memory card *is*.
+
+- Nintendont writes `/saves/GAMEID.raw` — one card image **per game**.
+- Dolphin uses one shared card per region, holding **every** game's saves at once.
+
+So saves cannot move between them by copying whole cards, and pulling a single save out
+of a shared card is exactly the byte-level surgery that corrupts cards (see
+[`PLAN.md`](PLAN.md) §5). The way out is to make the PC side use per-game cards too:
+`dolphin/` keeps a directory of them and repoints Dolphin's `MemcardAPath` before a game
+runs. Both sides then speak the same unit and sync stays byte-exact.
 
 ## Quick start
 
@@ -58,23 +74,23 @@ Two things to know:
 ## Trying it without Docker
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+python -m venv .venv && .venv/bin/pip install \n    -r server/requirements.txt -r server/requirements-dev.txt
 export SLOTSYNC_TOKEN=dev-token SLOTSYNC_PSK=dev-psk SLOTSYNC_DATA=./data
-PYTHONPATH=src .venv/bin/python -m slotsync
+PYTHONPATH=server/src .venv/bin/python -m slotsync
 ```
 
 Then, from another shell:
 
 ```bash
-python scripts/make_fixture.py card.raw --mbit 16     --save "GALE01:zelda:The Legend of Zelda:Outset Island:11"
+python server/scripts/make_fixture.py card.raw --mbit 16     --save "GALE01:zelda:The Legend of Zelda:Outset Island:11"
 
 curl -X POST -H "Authorization: Bearer dev-token"     --data-binary @card.raw "http://localhost:8080/api/cards/GALE01/A?parent=0"
 
-SLOTSYNC_PSK=dev-psk python scripts/fake_console.py pull GALE01 A pulled.raw
+SLOTSYNC_PSK=dev-psk python server/scripts/fake_console.py pull GALE01 A pulled.raw
 ```
 
 `scripts/fake_console.py` stands in for the Wii client and can inject packet loss
-and reordering; see [`scripts/README.md`](scripts/README.md).
+and reordering; see [`server/scripts/README.md`](server/scripts/README.md).
 
 ## Building it
 

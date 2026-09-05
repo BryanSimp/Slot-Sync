@@ -1,6 +1,6 @@
 services:
   slotsync:
-    build: .
+    build: ./server
     container_name: slotsync
     restart: unless-stopped
     ports:

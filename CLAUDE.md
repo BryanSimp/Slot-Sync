@@ -1,7 +1,18 @@
 # Working notes for coding sessions
 
 `PLAN.md` is the spec. Read it before writing anything. `docs/PROTOCOL.md` is the wire
-format. If you change a decision, update the doc in the same commit as the code.
+format and `docs/MEMCARD.md` the verified card layout. If you change a decision, update
+the doc in the same commit as the code.
+
+## Layout
+
+Three parts in one repo: `server/` (the Docker hub), `dolphin/` (PC daemon), `wii/`
+(libogc homebrew). `docs/` is shared. Run the server's tests from inside `server/`.
+
+The wire protocol now has three implementations -- the server, `fake_console.py`, and
+the Wii client. That is deliberate (an independent client catches wire-format bugs a
+shared module would hide) and it is also the thing most likely to drift. A protocol
+change means touching all three and `docs/PROTOCOL.md` in one commit.
 
 ## Rules specific to this project
 
@@ -22,10 +33,10 @@ format. If you change a decision, update the doc in the same commit as the code.
 ## Testing
 
 Real Nintendont `.raw` files are the only fixtures that matter. Put them in
-`tests/fixtures/`. If none are available yet, generate synthetic cards with
-`scripts/make_fixture.py` and mark those tests as approximate.
+`server/tests/fixtures/`. If none are available yet, generate synthetic cards with
+`server/scripts/make_fixture.py` and mark those tests as approximate.
 
-`scripts/fake_console.py` stands in for the Wii client. It must be able to inject packet
+`server/scripts/fake_console.py` stands in for the Wii client. It must be able to inject packet
 loss and reordering, because the real client will experience both.
 
 ## Commit style
