@@ -235,3 +235,11 @@ def test_rollback_requires_a_session(client):
     response = client.post("/cards/GALE01/A/rollback/1")
     assert response.status_code == 303
     assert "/login" in response.headers["location"]
+
+
+def test_the_empty_state_example_uses_the_real_server_address(signed_in):
+    """It hardcoded localhost:8080, which is wrong the moment the server is not
+    on localhost -- which, deployed behind a reverse proxy, it never is."""
+    body = signed_in.get("/").text
+    assert "localhost:8080" not in body
+    assert "/api/cards/GALE01/A?parent=0" in body

@@ -12,7 +12,7 @@
     </p>
     <pre class="mono" style="margin:.75rem 0 0; overflow-x:auto"><code>curl -X POST -H "Authorization: Bearer $SLOTSYNC_TOKEN" \
      --data-binary @GALE01.raw \
-     "http://localhost:8080/api/cards/GALE01/A?parent=0"</code></pre>
+     "{{ request.base_url }}api/cards/GALE01/A?parent=0"</code></pre>
   </div>
 {% else %}
   <div class="scroll">

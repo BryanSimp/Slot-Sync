@@ -34,6 +34,12 @@ class Config:
     max_card_bytes: int = 16 * 1024 * 1024
     log_level: str = "INFO"
 
+    #: Whose X-Forwarded-* headers to believe. "*" suits the documented
+    #: deployment -- a reverse proxy in front, on a LAN -- but it does mean
+    #: trusting whatever can reach the port, so narrow it to the proxy's
+    #: address if the container is exposed more widely.
+    forwarded_allow_ips: str = "*"
+
     #: Off unless explicitly enabled, so importing the app in a test never
     #: binds a UDP port. `from_env` turns it on.
     enable_udp: bool = False
@@ -104,6 +110,7 @@ class Config:
             udp_port=_int(src, "SLOTSYNC_UDP_PORT", 9977),
             max_card_bytes=_int(src, "SLOTSYNC_MAX_CARD_BYTES", 16 * 1024 * 1024),
             log_level=src.get("SLOTSYNC_LOG_LEVEL", "INFO").upper(),
+            forwarded_allow_ips=src.get("SLOTSYNC_FORWARDED_ALLOW_IPS", "*"),
             enable_udp=True,
             staging_ttl=_float(src, "SLOTSYNC_STAGING_TTL", 120.0),
             max_staging=_int(src, "SLOTSYNC_MAX_STAGING", 64),

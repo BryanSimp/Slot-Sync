@@ -57,3 +57,15 @@ def test_placeholder_secret_is_refused(placeholder):
 def test_non_integer_port_is_refused():
     with pytest.raises(ConfigError, match="SLOTSYNC_HTTP_PORT"):
         Config.from_env(GOOD | {"SLOTSYNC_HTTP_PORT": "eighty-eighty"})
+
+
+def test_forwarded_allow_ips_defaults_to_trusting_the_proxy():
+    """PLAN.md section 2 puts a reverse proxy in front of the HTTP API, and
+    uvicorn trusts only 127.0.0.1 unless told otherwise -- which is never the
+    proxy's address when both are containers."""
+    assert Config.from_env(dict(GOOD)).forwarded_allow_ips == "*"
+
+
+def test_forwarded_allow_ips_can_be_narrowed():
+    cfg = Config.from_env(GOOD | {"SLOTSYNC_FORWARDED_ALLOW_IPS": "172.18.0.2"})
+    assert cfg.forwarded_allow_ips == "172.18.0.2"
