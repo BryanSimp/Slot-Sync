@@ -51,20 +51,53 @@ docker compose up -d --build
 Saves live in the `slotsync-data` named volume, not in the checkout, so
 redeploying the stack cannot take your version history with it.
 
-### On Portainer
+### On Portainer, from the container registry
 
-**Stacks → Add stack → Repository.** Point it at this repo, compose path
-`docker-compose.yml`. If the repo is private, turn on Authentication and give it
-a GitHub token with `repo` scope. Then add two stack environment variables:
+Pushing to `main` builds `server/Dockerfile` and publishes it to GitHub
+Container Registry as **`ghcr.io/bryansimp/slot-sync:latest`**, for both
+`linux/amd64` and `linux/arm64` — see
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml). The tests gate
+the publish, so a red build never becomes an image.
+
+The Portainer host then only needs to *pull*. It needs no build toolchain, no
+checkout, and no access to the source.
+
+**1. Add the registry.** Portainer → **Registries → Add registry → Custom**:
+
+| Field | Value |
+|---|---|
+| Name | `ghcr` |
+| Registry URL | `ghcr.io` |
+| Authentication | on |
+| Username | your GitHub username |
+| Password | a token with **`read:packages`** scope |
+
+That step is only needed while the package is private. A package inherits its
+repository's visibility, so if you make it public — GitHub → your profile →
+Packages → `slot-sync` → Package settings → Change visibility — Portainer can
+pull it with no credentials at all.
+
+**2. Deploy the stack.** Portainer → **Stacks → Add stack → Web editor**, and
+paste [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml). Add two stack
+environment variables:
 
 | Name | Value |
 |---|---|
 | `SLOTSYNC_TOKEN` | `openssl rand -hex 32` |
 | `SLOTSYNC_PSK` | `openssl rand -hex 32` |
 
-Portainer builds the image from `server/Dockerfile` itself. The stack will
-refuse to start if either variable is missing, which is deliberate — see
-`server/src/slotsync/config.py`.
+The container refuses to start if either is missing, which is deliberate — see
+`server/src/slotsync/config.py`. Keep both: the Dolphin daemon needs the token
+and the Wii client needs the PSK.
+
+To update later, re-pull the image and redeploy the stack; the `slotsync-data`
+volume carries the save history across.
+
+### On Portainer, building from source instead
+
+If you would rather Portainer build it: **Stacks → Add stack → Repository**,
+compose path `docker-compose.yml`, and turn on Authentication with a token that
+has `repo` scope while this repo is private. Same two environment variables.
 
 Web UI at `http://localhost:8080`. Sign in with the value of `SLOTSYNC_TOKEN`.
 

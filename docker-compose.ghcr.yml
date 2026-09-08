@@ -1,0 +1,34 @@
+# Deploy from the published image instead of building.
+#
+# This is the file to paste into Portainer's stack web editor. It needs no
+# access to the source at all -- only to the registry -- so the Portainer host
+# never needs a build toolchain or a checkout of this repo.
+#
+# The image is built and pushed by .github/workflows/publish.yml.
+
+services:
+  slotsync:
+    image: ghcr.io/bryansimp/slot-sync:latest
+    container_name: slotsync
+    restart: unless-stopped
+    ports:
+      - "8080:8080/tcp"
+      # UDP, and it is the console's only way in. A firewall that passes 8080
+      # but blocks this gives you a working web UI and a Wii that cannot sync.
+      - "9977:9977/udp"
+    volumes:
+      # Named, so redeploying the stack cannot take the save history with it.
+      - slotsync-data:/data
+    environment:
+      SLOTSYNC_DATA: /data
+      SLOTSYNC_HTTP_PORT: 8080
+      SLOTSYNC_UDP_PORT: 9977
+      # Both are required and the container refuses to start without them.
+      # Set them as stack environment variables in Portainer.
+      SLOTSYNC_TOKEN: ${SLOTSYNC_TOKEN:?set SLOTSYNC_TOKEN as a stack variable}
+      SLOTSYNC_PSK: ${SLOTSYNC_PSK:?set SLOTSYNC_PSK as a stack variable}
+      SLOTSYNC_MAX_CARD_BYTES: 16777216
+      SLOTSYNC_LOG_LEVEL: INFO
+
+volumes:
+  slotsync-data:
