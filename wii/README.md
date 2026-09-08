@@ -26,11 +26,30 @@ are evidence, one that agrees with itself is not.
 
 ## Building
 
-Needs devkitPPC and libogc. **libfat is also required** and is not part of
-libogc:
+Needs devkitPPC, libogc and libfat. libfat is **not** part of libogc:
 
 ```bash
 dkp-pacman -S libfat-ogc
+```
+
+Versions matter and they cascade. Current libfat calls into libogc's device
+volume manager, which libogc 1.x does not have; and current libogc needs a
+newlib that only ships with newer devkitPPC. Building against a 2019-era
+toolchain fails three times over, each time with a link error that names a
+symbol rather than the real problem:
+
+| Symptom | Actually means |
+|---|---|
+| `undefined reference to __io_usbstorage_sector_size` | libfat is newer than libogc |
+| `undefined reference to __sf` | libogc is newer than devkitPPC's newlib |
+
+Built and verified against **devkitPPC r47.1 (GCC 15.1), libogc 2.12.2,
+libfat-ogc 2.1.0**. If a package looks installed but its files are absent,
+`pacman -Q` believing one thing while the disk holds another, reinstall it from
+the cache:
+
+```bash
+pacman -U /opt/devkitpro/pacman/pkg/libogc-2.12.2-1-any.pkg.tar.zst
 ```
 
 Then:

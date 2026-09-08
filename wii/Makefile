@@ -29,7 +29,11 @@ LDFLAGS  := -g $(MACHDEP) -Wl,-Map,$(notdir $@).map
 # remote; libogc is everything else.
 LIBS     := -lfat -lwiiuse -lbte -logc -lm
 
-LIBDIRS  := $(PORTLIBS) $(LIBOGC)
+# devkitPPC releases disagree about these: some export LIBOGC, others
+# LIBOGC_INC and LIBOGC_LIB. Derive whatever is missing from DEVKITPRO so this
+# builds against either.
+LIBOGC_INC ?= $(DEVKITPRO)/libogc/include
+LIBOGC_LIB ?= $(DEVKITPRO)/libogc/lib/wii
 
 #---------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -38,13 +42,23 @@ export OUTPUT   := $(CURDIR)/$(TARGET)
 export VPATH    := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR  := $(CURDIR)/$(BUILD)
 
+# Some Windows shells hand the toolchain a TMP it cannot write to -- C:\WINDOWS
+# is the usual one -- and the linker fails with "Cannot create temporary file".
+# -pipe spares the compiler but not ld, so point the whole toolchain at the
+# build directory, which is writable by definition.
+export TMPDIR   := $(CURDIR)/$(BUILD)
+export TMP      := $(CURDIR)/$(BUILD)
+export TEMP     := $(CURDIR)/$(BUILD)
+
 CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 export OFILES := $(CFILES:.c=.o)
 
 export INCLUDE  := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
-                   $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+                   $(foreach dir,$(PORTLIBS),-I$(dir)/include) \
+                   -I$(LIBOGC_INC) \
                    -I$(CURDIR)/$(BUILD)
-export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib/wii)
+export LIBPATHS := $(foreach dir,$(PORTLIBS),-L$(dir)/lib) \
+                   -L$(LIBOGC_LIB)
 export LD       := $(CC)
 
 .PHONY: all clean check run
