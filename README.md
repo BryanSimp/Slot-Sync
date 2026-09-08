@@ -119,9 +119,22 @@ Set these as stack variables to match your install:
 
 | Name | Typical |
 |---|---|
-| `TRAEFIK_NETWORK` | `traefik` or `proxy` |
+| `TRAEFIK_NETWORK` | `traefik`, `proxy`, or **`traefik_default`** |
 | `TRAEFIK_ENTRYPOINT` | `web` (:80) or `websecure` (:443) |
 | `SLOTSYNC_HOST` | `slotsync.yourdomain` |
+
+`network ... declared as external, but could not be found` means
+`TRAEFIK_NETWORK` does not match a real network. Compose prefixes networks with
+the stack name, so a Traefik deployed as a stack called `traefik` has a network
+called `traefik_default` — that catches most people. Ask Docker rather than
+guessing:
+
+```bash
+docker inspect $(docker ps -qf name=traefik)     --format '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}'
+```
+
+Whatever that prints is the value to use. Copying it off a service Traefik
+already routes is just as reliable.
 
 To update later, re-pull the image and redeploy the stack; the `slotsync-data`
 volume carries the save history across.
