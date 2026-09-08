@@ -46,6 +46,18 @@ int wii_saves_write(const char *dir, const char *game_id, const uint8_t *data,
 void wii_state_load(wii_state *state, const char *path);
 int wii_state_save(const wii_state *state, const char *path);
 
+/* Take over the versions the in-kernel sync reached during the last game.
+ *
+ * Nintendont's SlotSync writes `GAMEID SLOT VERSION` lines at `path` whenever
+ * it pushes a card mid-session. Without reading them we would still think the
+ * card descends from whatever it did before the game started, name that as the
+ * parent, and be told -- correctly -- that it is a conflict. Every session that
+ * used runtime sync would end in one.
+ *
+ * The file is removed once merged. Returns how many entries were taken, or -1
+ * if there was no file, which is the normal case. */
+int wii_state_merge_runtime(wii_state *state, const char *path);
+
 /* Look up, or add, the entry for a card. Never returns NULL unless full. */
 wii_card_state *wii_state_get(wii_state *state, const char *game_id, uint8_t slot);
 

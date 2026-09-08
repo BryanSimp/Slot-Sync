@@ -12,6 +12,10 @@
 #define WII_CFG_PATH "sd:/slotsync/slotsync.cfg"
 #define WII_SAVES_DIR "sd:/saves"
 #define WII_STATE_PATH "sd:/slotsync/state.txt"
+/* Written by the in-kernel sync in Nintendont (nintendont/), naming the
+ * versions it reached while the game was running. Read once at startup and
+ * removed. */
+#define WII_RUNTIME_PATH "sd:/slotsync/runtime.txt"
 
 #define WII_MAX_STR 128
 

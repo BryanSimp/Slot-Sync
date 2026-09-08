@@ -21,6 +21,7 @@ The wider project has three parts. **They now live in this one repo**, a directo
 | `server/` | The Docker hub. Storage, versioning, web UI, both ingest protocols. |
 | `dolphin/` | PC daemon. Manages per-game cards and syncs over HTTP. |
 | `wii/` | Homebrew wrapper, libogc. Pulls at launch, chainloads Nintendont, pushes on exit. |
+| `nintendont/` | Phase 2. A patch onto Nintendont's ARM kernel that pushes mid-game. |
 
 *Changed from the original plan, which put the two clients in separate repos.* One repo
 keeps the wire protocol in lockstep across three implementations of it, which is the
@@ -29,6 +30,22 @@ thing most likely to drift. `docs/` stays at the root because all three parts re
 There is a **phase 2** for the console client: moving the push logic from the libogc
 wrapper into Nintendont's ARM kernel so saves sync mid-game. The server must be ready
 for that client on day one. See §3.
+
+*Phase 2 now exists in `nintendont/`, as a patch rather than a fork -- 54 lines of hooks
+into Nintendont plus new sources.* It turned out far more tractable than expected, for
+three reasons worth recording because the rest of the design leans on them:
+
+- Nintendont keeps the whole card image in ARM-addressable RAM at `0x11000000`
+  (`kernel/GCNCard.c`), so there is nothing to read back off the SD card to push.
+- It already tracks the dirty byte range and already debounces the write-out, so the
+  trigger a sync needs is there and already settled.
+- `SOCKInit()` opens `/dev/net/ip/top` on **every** boot, not only when a game wants the
+  BBA emulation, and `kernel/sock.c` is a complete working reference for the ioctls.
+
+So the constraints in §2 were not the obstacle they were written to guard against. They
+are still right: the client is C with no libc, no TLS, no allocation, a 16 KB stack and
+static buffers throughout. What could not be verified without a console is listed in
+`nintendont/README.md`, and it is the IOS socket calls and the real-time impact.
 
 ---
 
@@ -546,12 +563,45 @@ Resolve these as you go and record the answers here.
 - [ ] Does Nintendont return control to the launching `.dol` on game exit, and does it
       preserve enough state to identify which game just ran? *This determines whether
       the wrapper syncs on exit or on next launch. Spike it before writing the client.*
+      *Less load-bearing now:* with `nintendont/` applied, the kernel pushes during the
+      session and hands its versions over in `/slotsync/runtime.txt`, which the wrapper
+      merges at its next start. The answer still decides how promptly a final save
+      lands, but no longer whether one does.
+
+- [ ] Can the console sustain the ~1600 datagrams/sec the shipped pacing offers, over
+      real 802.11g, without the game stuttering? Loopback says a 2 MiB card is 1.6 s and
+      a 16 MiB card 9.3 s of wire time at that rate, and pacing dominates both — so the
+      timings hold if the console can keep up. *This is the question that decides whether
+      runtime sync is pleasant or merely possible.*
+
+- [ ] Should the server seed a staging buffer from the parent version, so a push can send
+      only the bytes that changed? `_on_push_begin` starts every buffer at
+      `bytearray(total_size)`, so today a partial push would commit a mostly-zero card
+      and the in-kernel client sends whole cards every time. Nintendont already tracks
+      the dirty range in `GCNCard_ctx`, so the console side is nearly free; the server
+      side is a protocol change and would have to land across the server,
+      `fake_console.py`, `wii/core` and `docs/PROTOCOL.md` in one commit. It is not
+      merging two cards — it is resuming one lineage — so §5 does not forbid it.
 - [x] Confirmed byte offsets for the memcard header fields, checked against Dolphin's
       source rather than recalled. **Done** — see [`docs/MEMCARD.md`](docs/MEMCARD.md).
       Two corrections came out of it: there are six valid card sizes, not four, and
       YAGCD's directory checksum offsets are wrong where Dolphin's are right.
-- [ ] Does Nintendont's `GAMEID.raw` ever differ from a Dolphin-written raw of the same
-      card size — padding, trailing bytes, header serial?
+- [x] Does Nintendont's `GAMEID.raw` ever differ from a Dolphin-written raw of the same
+      card size — padding, trailing bytes, header serial? **Partly answered, and the
+      answer is about the *name*, not the bytes.** Nintendont writes
+      `/saves/GALE.raw` — **four** characters, because `ncfg->GameID` is a `u32`
+      (`kernel/GCNCard.c`, and `loader/source/main.c:1102`). Not `GALE01.raw`. Slot B
+      appends `_B`; "multi" mode writes `ninmem.raw` / `ninmemj.raw` instead. The
+      contents are a plain card image and nothing suggests they differ from Dolphin's.
+
+      **This breaks `wii_saves_scan`**, which requires a name of exactly
+      `GAMEID.raw` with a six-character ID and so finds no cards at all in a real
+      Nintendont `/saves` — except in multi mode, where `ninmem.raw` happens to be ten
+      characters and gets treated as a game called "ninmem". Left unfixed here because
+      the fix has to decide what the server keys such a card by, which touches the
+      Dolphin side too. The in-kernel client sidesteps it: it takes the four characters
+      from Nintendont and reads the maker code out of the card's own directory entries
+      (`docs/MEMCARD.md`), giving the full six-character ID with no filename involved.
 - [ ] Real observed throughput of a 2 MiB push over Wii 802.11g, to size the chunk
       timeout sensibly. *Partly answered on loopback — see §4. The finding that mattered
       was not throughput but buffering: an unpaced burst overruns the receive socket long

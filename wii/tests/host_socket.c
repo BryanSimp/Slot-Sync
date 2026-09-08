@@ -51,6 +51,11 @@ int host_socket_open(host_socket *s, const char *host, unsigned short port)
 {
     struct sockaddr_in *addr = (struct sockaddr_in *)&s->addr;
 
+    /* Zero the whole struct rather than each field: callers declare one on the
+     * stack, so anything left unset here is read as garbage. Set the knobs --
+     * loss_percent, pace_every, pace_us -- after this returns. */
+    memset(s, 0, sizeof(*s));
+
     s->fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
     if (s->fd == HOST_FD_INVALID) {
         return -1;
@@ -65,9 +70,6 @@ int host_socket_open(host_socket *s, const char *host, unsigned short port)
         return -1;
     }
 
-    s->dropped_out = 0;
-    s->dropped_in = 0;
-    s->loss_percent = 0;
     s->rng = 12345u;
     return 0;
 }
@@ -90,10 +92,38 @@ static int should_drop(host_socket *s)
     return (int)((s->rng >> 16) % 100u) < s->loss_percent;
 }
 
+/* Pause between bursts, so a live test can offer the same load the console's
+ * paced transport offers rather than flooding loopback. */
+static void host_socket_pace(host_socket *s)
+{
+    if (s->pace_every == 0 || s->pace_us == 0) {
+        return;
+    }
+    if (++s->sent_since_pause < s->pace_every) {
+        return;
+    }
+    s->sent_since_pause = 0;
+#ifdef _WIN32
+    Sleep((s->pace_us + 999) / 1000);
+#else
+    {
+        /* select() with no descriptors is the sub-second sleep that is
+         * already available here -- nanosleep would need a feature-test
+         * macro that -std=c99 -Wpedantic has switched off. */
+        struct timeval tv;
+        tv.tv_sec = (long)(s->pace_us / 1000000u);
+        tv.tv_usec = (long)(s->pace_us % 1000000u);
+        select(0, NULL, NULL, NULL, &tv);
+    }
+#endif
+}
+
 int host_socket_send(void *ctx, const unsigned char *data, size_t len)
 {
     host_socket *s = (host_socket *)ctx;
     struct sockaddr_in *addr = (struct sockaddr_in *)&s->addr;
+
+    host_socket_pace(s);
 
     if (should_drop(s)) {
         s->dropped_out++;

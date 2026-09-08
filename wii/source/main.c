@@ -306,6 +306,16 @@ int main(int argc, char **argv)
     printf("server   protocol v%u, ok\n\n", server_version);
 
     wii_state_load(&state, WII_STATE_PATH);
+    {
+        /* Pick up anything Nintendont's in-kernel sync pushed while the last
+         * game was running, so we name the right parent below. */
+        int merged = wii_state_merge_runtime(&state, WII_RUNTIME_PATH);
+        if (merged > 0) {
+            printf("runtime sync moved %d card(s) on during the last game\n\n",
+                   merged);
+            wii_state_save(&state, WII_STATE_PATH);
+        }
+    }
     sync_all(&client, &cfg, &state);
     wii_net_close(&sock);
 
