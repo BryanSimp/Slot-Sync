@@ -556,3 +556,9 @@ Resolve these as you go and record the answers here.
       timeout sensibly. *Partly answered on loopback — see §4. The finding that mattered
       was not throughput but buffering: an unpaced burst overruns the receive socket long
       before it troubles the network. Still needs a real console on real WiFi.*
+
+      *Measured again against a real deployment, over wired LAN: a **16 MiB** card, all
+      16384 chunks, pulled in **1.78 s with zero loss and no retransmission round** —
+      about 9 MB/s. So the server and the protocol are nowhere near being the bottleneck,
+      and whatever the Wii manages will be set by 802.11g and the Starlet, not by this.
+      The same card pushed over HTTPS in 0.6 s.*

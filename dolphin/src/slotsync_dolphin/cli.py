@@ -21,6 +21,11 @@ from .sync import Syncer, SyncError
 log = logging.getLogger("slotsync")
 
 
+def _opt(args, name, default=None):
+    """Read a global option. SUPPRESS leaves unused ones out of the namespace."""
+    return getattr(args, name, default)
+
+
 def _configure_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -117,14 +122,14 @@ def cmd_status(config: Config, args) -> int:
 
 
 def cmd_pull(config: Config, args) -> int:
-    outcome = Syncer(config).pull(args.game_id, args.slot)
+    outcome = Syncer(config).pull(args.game_id, _opt(args, "slot"))
     print(f"{outcome.game_id} slot {outcome.slot}: {outcome.action} v{outcome.version}")
     print(f"  {outcome.path}")
     return 0
 
 
 def cmd_push(config: Config, args) -> int:
-    outcome = Syncer(config).push(args.game_id, args.slot)
+    outcome = Syncer(config).push(args.game_id, _opt(args, "slot"))
     if outcome.action == "nothing":
         print(f"{outcome.game_id} slot {outcome.slot}: no local changes")
     else:
@@ -138,9 +143,9 @@ def cmd_push(config: Config, args) -> int:
 def cmd_use(config: Config, args) -> int:
     """Pull and point Dolphin at a game, without launching it."""
     syncer = Syncer(config)
-    outcome = syncer.pull(args.game_id, args.slot)
+    outcome = syncer.pull(args.game_id, _opt(args, "slot"))
     changed = syncer.point_dolphin_at(
-        args.game_id, args.slot or config.slot, force=args.force
+        args.game_id, _opt(args, "slot") or config.slot, force=_opt(args, "force")
     )
 
     print(f"{outcome.game_id} slot {outcome.slot}: {outcome.action} v{outcome.version}")
@@ -155,9 +160,9 @@ def cmd_play(config: Config, args) -> int:
     pulled, pushed = syncer.play(
         args.game_id,
         Path(args.exec) if args.exec else None,
-        args.slot,
+        _opt(args, "slot"),
         launch=not args.no_launch,
-        force=args.force,
+        force=_opt(args, "force"),
     )
     print(f"{pulled.game_id} slot {pulled.slot}: {pulled.action} v{pulled.version}")
     if pushed is None:
@@ -179,7 +184,7 @@ def cmd_watch(config: Config, args) -> int:
 
 def cmd_list(config: Config, args) -> int:
     """Saves on a card, as the server parses them."""
-    detail = Syncer(config).client.card(args.game_id, args.slot or config.slot)
+    detail = Syncer(config).client.card(args.game_id, _opt(args, "slot") or config.slot)
     if detail is None:
         print(f"the server has no card for {args.game_id}")
         return 1
@@ -203,34 +208,74 @@ def cmd_list(config: Config, args) -> int:
 # --- entry point ----------------------------------------------------------
 
 
+def _add_global_options(parser: argparse.ArgumentParser) -> None:
+    """Options accepted either before or after the subcommand.
+
+    They go on every subparser as well as the top level, because
+    `setup --server X` is how anyone would actually type it and argparse
+    otherwise accepts only `--server X setup`.
+
+    SUPPRESS matters: without it, an option given before the subcommand would
+    be overwritten with None by the subparser's own default.
+    """
+    parser.add_argument(
+        "--server", default=argparse.SUPPRESS, help="e.g. https://slotsync.example.com"
+    )
+    parser.add_argument(
+        "--token", default=argparse.SUPPRESS, help="defaults to $SLOTSYNC_TOKEN"
+    )
+    parser.add_argument(
+        "--cards-dir", default=argparse.SUPPRESS, help="where per-game cards are kept"
+    )
+    parser.add_argument(
+        "--user-dir", default=argparse.SUPPRESS, help="Dolphin's user directory"
+    )
+    parser.add_argument(
+        "--dolphin-exe", default=argparse.SUPPRESS, help="path to the Dolphin binary"
+    )
+    parser.add_argument(
+        "--slot",
+        choices=["A", "B", "a", "b"],
+        default=argparse.SUPPRESS,
+        help="default A",
+    )
+    parser.add_argument(
+        "--device",
+        type=lambda v: int(v, 0),
+        default=argparse.SUPPRESS,
+        help="u64 device id",
+    )
+    parser.add_argument(
+        "--mbit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="card size for a game the server has never seen, default 16",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="edit Dolphin.ini even though Dolphin is running (it may undo the change)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slotsync-dolphin",
         description="Sync Dolphin's GameCube memory cards with a SlotSync server.",
     )
-    parser.add_argument("--server", help="e.g. http://nas:8080")
-    parser.add_argument("--token", help="defaults to $SLOTSYNC_TOKEN")
-    parser.add_argument("--cards-dir", help="where per-game cards are kept")
-    parser.add_argument("--user-dir", help="Dolphin's user directory")
-    parser.add_argument("--dolphin-exe", help="path to the Dolphin binary")
-    parser.add_argument("--slot", choices=["A", "B", "a", "b"], help="default A")
-    parser.add_argument("--device", type=lambda v: int(v, 0), help="u64 device id")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="edit Dolphin.ini even though Dolphin is running (it may undo the change)",
-    )
+    _add_global_options(parser)
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     setup = sub.add_parser("setup", help="write the config file")
-    setup.add_argument("--mbit", type=int, help="card size for new games, default 16")
+    _add_global_options(setup)
     setup.set_defaults(func=cmd_setup)
 
-    sub.add_parser("status", help="what is local, what is on the server").set_defaults(
-        func=cmd_status
-    )
+    status = sub.add_parser("status", help="what is local, what is on the server")
+    _add_global_options(status)
+    status.set_defaults(func=cmd_status)
 
     for name, func, helptext in [
         ("pull", cmd_pull, "fetch a game's card from the server"),
@@ -240,12 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     ]:
         one = sub.add_parser(name, help=helptext)
         one.add_argument("game_id")
-        one.add_argument("--slot", choices=["A", "B", "a", "b"])
+        _add_global_options(one)
         one.set_defaults(func=func)
 
     play = sub.add_parser("play", help="pull, launch Dolphin, push on exit")
     play.add_argument("game_id")
-    play.add_argument("--slot", choices=["A", "B", "a", "b"])
+    _add_global_options(play)
     play.add_argument("--exec", help="ISO to boot directly")
     play.add_argument(
         "--no-launch",
@@ -255,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     play.set_defaults(func=cmd_play)
 
     watch = sub.add_parser("watch", help="push cards as they change")
+    _add_global_options(watch)
     watch.set_defaults(func=cmd_watch)
 
     return parser
@@ -262,18 +308,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    _configure_logging(args.verbose)
+    _configure_logging(bool(_opt(args, "verbose")))
 
     try:
         config = Config.load(
-            server=args.server,
-            token=args.token,
-            cards_dir=args.cards_dir,
-            user_dir=args.user_dir,
-            dolphin_exe=args.dolphin_exe,
-            slot=args.slot,
-            device=args.device,
-            mbit=getattr(args, "mbit", None),
+            server=_opt(args, "server"),
+            token=_opt(args, "token"),
+            cards_dir=_opt(args, "cards_dir"),
+            user_dir=_opt(args, "user_dir"),
+            dolphin_exe=_opt(args, "dolphin_exe"),
+            slot=_opt(args, "slot"),
+            device=_opt(args, "device"),
+            mbit=_opt(args, "mbit"),
         )
         return args.func(config, args)
 
