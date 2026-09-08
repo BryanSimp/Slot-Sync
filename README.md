@@ -45,8 +45,26 @@ runs. Both sides then speak the same unit and sync stays byte-exact.
 ```bash
 cp .env.example .env
 # edit .env and set SLOTSYNC_TOKEN and SLOTSYNC_PSK to real values
-docker compose up -d
+docker compose up -d --build
 ```
+
+Saves live in the `slotsync-data` named volume, not in the checkout, so
+redeploying the stack cannot take your version history with it.
+
+### On Portainer
+
+**Stacks → Add stack → Repository.** Point it at this repo, compose path
+`docker-compose.yml`. If the repo is private, turn on Authentication and give it
+a GitHub token with `repo` scope. Then add two stack environment variables:
+
+| Name | Value |
+|---|---|
+| `SLOTSYNC_TOKEN` | `openssl rand -hex 32` |
+| `SLOTSYNC_PSK` | `openssl rand -hex 32` |
+
+Portainer builds the image from `server/Dockerfile` itself. The stack will
+refuse to start if either variable is missing, which is deliberate — see
+`server/src/slotsync/config.py`.
 
 Web UI at `http://localhost:8080`. Sign in with the value of `SLOTSYNC_TOKEN`.
 

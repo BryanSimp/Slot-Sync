@@ -7,7 +7,12 @@ services:
       - "8080:8080/tcp"
       - "9977:9977/udp"
     volumes:
-      - ./data:/data
+      # A named volume, not ./data. Portainer checks a Git stack out into its
+      # own directory and can replace it on redeploy, so a relative bind mount
+      # puts your save history somewhere that is both obscure and not
+      # obviously safe. This survives redeploys and `docker volume` can back
+      # it up.
+      - slotsync-data:/data
     environment:
       SLOTSYNC_DATA: /data
       SLOTSYNC_HTTP_PORT: 8080
@@ -16,3 +21,6 @@ services:
       SLOTSYNC_PSK: ${SLOTSYNC_PSK:?set SLOTSYNC_PSK in .env}
       SLOTSYNC_MAX_CARD_BYTES: 16777216
       SLOTSYNC_LOG_LEVEL: INFO
+
+volumes:
+  slotsync-data:
