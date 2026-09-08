@@ -1,0 +1,62 @@
+# SlotSync behind Traefik.
+#
+# The web UI gets routed by Traefik like any other service, so it needs no host
+# port at all -- which sidesteps the 8080/8081 crowding entirely. The console's
+# UDP port is still published directly, because that path deliberately does not
+# go through a proxy: PLAN.md section 2 keeps it plain UDP with an HMAC, since
+# there is no usable TLS stack on the Wii's ARM co-processor.
+#
+# That split is exactly what PLAN.md section 2 has in mind by "put TLS in front
+# of the HTTP API via a reverse proxy if you want it; never require it".
+#
+# Check these against your Traefik setup before deploying -- network name and
+# entrypoint names vary between installs:
+#
+#   TRAEFIK_NETWORK     the external docker network Traefik watches
+#   TRAEFIK_ENTRYPOINT  usually "web" (:80) or "websecure" (:443)
+#   SLOTSYNC_HOST       the hostname you want the UI on
+#   TRAEFIK_CERTRESOLVER  your ACME resolver, if using websecure
+
+services:
+  slotsync:
+    image: ghcr.io/bryansimp/slot-sync:latest
+    container_name: slotsync
+    restart: unless-stopped
+
+    ports:
+      # No HTTP port here on purpose -- Traefik reaches the container over the
+      # docker network. Only the console path is published.
+      - "${SLOTSYNC_UDP_BIND:-9977}:9977/udp"
+
+    volumes:
+      - slotsync-data:/data
+
+    environment:
+      SLOTSYNC_DATA: /data
+      SLOTSYNC_HTTP_PORT: 8080
+      SLOTSYNC_UDP_PORT: 9977
+      SLOTSYNC_TOKEN: ${SLOTSYNC_TOKEN:?set SLOTSYNC_TOKEN as a stack variable}
+      SLOTSYNC_PSK: ${SLOTSYNC_PSK:?set SLOTSYNC_PSK as a stack variable}
+      SLOTSYNC_MAX_CARD_BYTES: 16777216
+      SLOTSYNC_LOG_LEVEL: INFO
+
+    networks:
+      - traefik
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.http.routers.slotsync.rule=Host(`${SLOTSYNC_HOST:-slotsync.local}`)"
+      - "traefik.http.routers.slotsync.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      # The port inside the container, not a host port.
+      - "traefik.http.services.slotsync.loadbalancer.server.port=8080"
+      # Uncomment if your entrypoint is websecure and you use ACME:
+      # - "traefik.http.routers.slotsync.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}
+
+volumes:
+  slotsync-data:

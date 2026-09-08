@@ -103,6 +103,26 @@ Only the host side moves; the container still listens on 8080 and 9977
 internally. If you move the UDP one, the port in the Wii's
 `sd:/slotsync/slotsync.cfg` has to match.
 
+### Behind Traefik
+
+If you already run Traefik, [`docker-compose.traefik.yml`](docker-compose.traefik.yml)
+routes the web UI through it and publishes **no HTTP host port at all**, which
+sidesteps port crowding entirely. The console's UDP port is still published
+directly.
+
+That split is the one `PLAN.md` §2 describes: TLS in front of the HTTP API via a
+reverse proxy is fine and expected, but the console path stays plain UDP with an
+HMAC, because there is no usable TLS stack on the Wii's ARM co-processor. Traefik
+can route UDP, but there is nothing to gain by putting it in that path.
+
+Set these as stack variables to match your install:
+
+| Name | Typical |
+|---|---|
+| `TRAEFIK_NETWORK` | `traefik` or `proxy` |
+| `TRAEFIK_ENTRYPOINT` | `web` (:80) or `websecure` (:443) |
+| `SLOTSYNC_HOST` | `slotsync.yourdomain` |
+
 To update later, re-pull the image and redeploy the stack; the `slotsync-data`
 volume carries the save history across.
 
