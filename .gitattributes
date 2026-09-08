@@ -5,3 +5,7 @@
 
 # Memory card images are binary. Never touch them.
 *.raw binary
+
+# The Nintendont hook patch. Its context lines come from CRLF sources, so
+# normalising it to LF would stop it applying. Keep the bytes as they are.
+nintendont/patches/*.patch -text

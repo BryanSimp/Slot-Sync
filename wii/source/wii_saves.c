@@ -193,6 +193,47 @@ int wii_state_save(const wii_state *state, const char *path)
     return 0;
 }
 
+int wii_state_merge_runtime(wii_state *state, const char *path)
+{
+    FILE *file = fopen(path, "r");
+    char line[160];
+    int merged = 0;
+
+    if (file == NULL) {
+        return -1; /* no runtime sync happened, which is the normal case */
+    }
+
+    while (fgets(line, (int)sizeof(line), file) != NULL) {
+        char game_id[WII_GAME_ID_LEN + 1];
+        wii_card_state *card;
+        unsigned slot;
+        unsigned version;
+
+        if (sscanf(line, "%6s %u %u", game_id, &slot, &version) != 3) {
+            continue;
+        }
+        card = wii_state_get(state, game_id, (uint8_t)slot);
+        if (card == NULL) {
+            continue;
+        }
+        /* Only ever move forward. A stale runtime.txt must not walk a card's
+         * lineage backwards, which would turn the next push into an overwrite
+         * of versions nobody has seen. */
+        if (card->known && version <= card->version) {
+            continue;
+        }
+        card->version = (uint32_t)version;
+        card->known = 1;
+        /* The digest is deliberately left alone. It no longer matches the card,
+         * so sync_one will push once at startup -- which is right, because play
+         * almost certainly continued after the kernel's last push. */
+        merged++;
+    }
+    fclose(file);
+    remove(path);
+    return merged;
+}
+
 wii_card_state *wii_state_get(wii_state *state, const char *game_id, uint8_t slot)
 {
     int i;

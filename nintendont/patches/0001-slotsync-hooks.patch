@@ -1,0 +1,138 @@
+diff --git a/kernel/GCNCard.c b/kernel/GCNCard.c
+index 5ecd36b..4b2c768 100644
+--- a/kernel/GCNCard.c
++++ b/kernel/GCNCard.c
+@@ -3,6 +3,7 @@
+ 
+ #include "GCNCard.h"
+ #include "Config.h"
++#include "SlotSync.h"
+ #include "debug.h"
+ #include "ff_utf8.h"
+ 
+@@ -272,6 +273,20 @@ u32 GCNCard_GetTotalSize(void)
+ #endif /* GCNCARD_ENABLE_SLOT_B */
+ }
+ 
++const u8 *GCNCard_GetBase(int slot)
++{
++	if (!GCNCard_IsEnabled(slot))
++		return NULL;
++	return memCard[slot].base;
++}
++
++u32 GCNCard_GetSize(int slot)
++{
++	if (!GCNCard_IsEnabled(slot))
++		return 0;
++	return memCard[slot].size;
++}
++
+ /**
+ * Check if the memory cards have changed.
+ * @return True if either memory card has changed; false if not.
+@@ -346,6 +361,11 @@ void GCNCard_Save(void)
+ //#ifdef DEBUG_EXI
+ 				//dbgprintf("Done!\r\n");
+ //#endif
++
++				/* The card on the SD card and the copy in RAM
++				 * now agree. Tell SlotSync; it decides when,
++				 * and whether, to push. Returns immediately. */
++				SlotSync_NotifyCardSaved(slot);
+ 			}
+ 			else
+ 			{
+diff --git a/kernel/GCNCard.h b/kernel/GCNCard.h
+index 304b431..3a3336d 100644
+--- a/kernel/GCNCard.h
++++ b/kernel/GCNCard.h
+@@ -32,6 +32,20 @@ int GCNCard_Load(int slot);
+  */
+ u32 GCNCard_GetTotalSize(void);
+ 
++/**
++ * Get the card image for a slot, live in ARM-addressable RAM.
++ * SlotSync reads it in place rather than re-reading the SD card.
++ * @param slot Slot number.
++ * @return Base address, or NULL if the slot is disabled.
++ */
++const u8 *GCNCard_GetBase(int slot);
++
++/**
++ * Get the size of one slot's card image, in bytes. 0 if disabled.
++ * @param slot Slot number.
++ */
++u32 GCNCard_GetSize(int slot);
++
+ /**
+ * Check if the memory cards have changed.
+ * @return True if either memory card has changed; false if not.
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 5f65844..302e98f 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -36,7 +36,9 @@ OBJECTS	:= start.o common.o alloc.o GCAM.o JVSIO.o JVSIOMessage.o FST.o DI.o Rea
+ 	   Patch.o PatchTimers.o TRI.o PatchWidescreen.o ISO.o Stream.o adp.o \
+ 	   EXI.o SRAM.o GCNCard.o SI.o HID.o diskio.o Config.o utils_asm.o ES.o NAND.o \
+ 	   main.o syscalls.o ReadSpeed.o vsprintf.o string.o prs.o \
+-	   SDI.o usb.o usbstorage.o wdvd.o sock.o
++	   SDI.o usb.o usbstorage.o wdvd.o sock.o \
++	   SlotSync.o SlotSyncNet.o SlotSyncLogic.o \
++	   slotsync/protocol.o slotsync/client.o slotsync/sha256.o
+ LIBS	:= ../fatfs/libfatfs-arm.a be/libc.a be/libgcc.a
+ ZIPFILE	:= ../loader/data/kernel.zip
+ 
+diff --git a/kernel/kernel.ld b/kernel/kernel.ld
+index 77907d1..c390ebe 100644
+--- a/kernel/kernel.ld
++++ b/kernel/kernel.ld
+@@ -21,6 +21,12 @@ __intr_stack_addr = __hid_stack_addr + __intr_stack_size;
+ __blk_stack_size = 0x400;
+ __blk_stack_addr = __intr_stack_addr + __blk_stack_size;
+ 
++/* SlotSync worker. Bigger than its neighbours because the protocol core builds
++ * a 1120-byte datagram on the stack at each of three nesting levels. The
++ * region is 0x10000 long and the stacks above it total 0x4000, so this fits. */
++__slotsync_stack_size = 0x4000;
++__slotsync_stack_addr = __blk_stack_addr + __slotsync_stack_size;
++
+ MEMORY {
+ 
+ 	code		: ORIGIN = 0x12F00000,	LENGTH = 0x60000
+diff --git a/kernel/main.c b/kernel/main.c
+index fac0829..7560867 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ #include "HID.h"
+ #include "EXI.h"
+ #include "sock.h"
++#include "SlotSync.h"
+ #include "GCNCard.h"
+ #include "debug.h"
+ #include "GCAM.h"
+@@ -258,6 +259,12 @@ int _main( int argc, char *argv[] )
+ 	PatchInit();
+ 
+ 	SOCKInit();
++
++	/* SlotSync: card sync while the game runs. A no-op unless
++	 * /slotsync/slotsync.cfg exists and enables it. Must come after
++	 * EXIInit, which is what loads the cards, and after SOCKInit. */
++	SlotSync_Init();
++
+ //Tell PPC side we are ready!
+ 	cc_ahbMemFlush(1);
+ 	mdelay(1000);
+@@ -462,6 +469,10 @@ int _main( int argc, char *argv[] )
+ 		if (reset_status == 0x1DEA)
+ 		{
+ 			dbgprintf("Game Exit\r\n");
++			/* Before the final GCNCard_Save, so a transfer already
++			 * in flight gets a bounded moment to land and record
++			 * its version for the launcher. */
++			SlotSync_Shutdown();
+ 			DIFinishAsync();
+ 			break;
+ 		}

@@ -11,6 +11,15 @@ typedef struct {
      * headers. 32 bytes is comfortably enough on every platform here. */
     unsigned char addr[32];
 
+    /* Send pacing, matching what the console's transport does: pause for
+     * `pace_us` after every `pace_every` datagrams. 0 in either field sends as
+     * fast as the host will go, which is the default and what the loss tests
+     * want. A live test that wants to offer the same load a console offers
+     * sets these. */
+    unsigned pace_every;
+    unsigned pace_us;
+    unsigned sent_since_pause;
+
     /* Injected link damage, for the loss/reordering tests. */
     int loss_percent;
     unsigned int rng;

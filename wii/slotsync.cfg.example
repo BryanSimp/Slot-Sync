@@ -24,3 +24,31 @@ autoboot   = 1
 # Per-reply timeout and how many retransmission rounds before giving up.
 timeout_ms = 2000
 rounds     = 12
+
+# ---------------------------------------------------------------------------
+# Runtime sync, read by the in-kernel client in nintendont/ and ignored by the
+# wrapper. Only has an effect on a Nintendont build that has been patched with
+# nintendont/apply.sh.
+# ---------------------------------------------------------------------------
+
+# 1 to push cards to the server while the game is running, 0 to leave that to
+# the wrapper on either side of a session.
+runtime_sync = 1
+
+# How long a card must go untouched before it is pushed. A game writing a save
+# touches it several times in a row; this waits for it to finish.
+runtime_quiet_ms = 4000
+
+# Minimum gap between two pushes of the same card. Every push sends the whole
+# card, so this is what keeps a game that saves often off the radio.
+runtime_cooldown_ms = 30000
+
+# How long to wait for DHCP before giving up and backing off.
+runtime_net_timeout_ms = 20000
+
+# Send pacing: pause for `pace_us` after every `pace_every` datagrams. The
+# defaults offer 1600 datagrams/sec, under the server's own SLOTSYNC_UDP_RATE
+# of 2048/sec. Raising these without raising that does not make a card arrive
+# sooner -- it makes the server drop chunks and the console resend them.
+runtime_pace_every = 8
+runtime_pace_us = 5000
