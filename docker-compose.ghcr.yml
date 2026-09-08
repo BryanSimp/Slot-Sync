@@ -12,10 +12,14 @@ services:
     container_name: slotsync
     restart: unless-stopped
     ports:
-      - "8080:8080/tcp"
-      # UDP, and it is the console's only way in. A firewall that passes 8080
-      # but blocks this gives you a working web UI and a Wii that cannot sync.
-      - "9977:9977/udp"
+      # Host ports are overridable, because 8080 in particular is heavily
+      # contested on a home server -- Portainer, qBittorrent, Jenkins and a
+      # dozen other things default to it. Only the host side moves; the
+      # container still listens on 8080/9977 internally.
+      - "${SLOTSYNC_HTTP_BIND:-8080}:8080/tcp"
+      # UDP, and it is the console's only way in. If you move this, the port in
+      # the Wii's sd:/slotsync/slotsync.cfg has to match.
+      - "${SLOTSYNC_UDP_BIND:-9977}:9977/udp"
     volumes:
       # Named, so redeploying the stack cannot take the save history with it.
       - slotsync-data:/data

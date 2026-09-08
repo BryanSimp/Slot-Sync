@@ -90,6 +90,19 @@ The container refuses to start if either is missing, which is deliberate — see
 `server/src/slotsync/config.py`. Keep both: the Dolphin daemon needs the token
 and the Wii client needs the PSK.
 
+**If the stack fails with `port is already allocated`**, something on the host
+already has that port — 8080 especially is contested on a home server. Add a
+stack variable rather than editing the compose:
+
+| Name | Example |
+|---|---|
+| `SLOTSYNC_HTTP_BIND` | `8081` |
+| `SLOTSYNC_UDP_BIND` | `9977` |
+
+Only the host side moves; the container still listens on 8080 and 9977
+internally. If you move the UDP one, the port in the Wii's
+`sd:/slotsync/slotsync.cfg` has to match.
+
 To update later, re-pull the image and redeploy the stack; the `slotsync-data`
 volume carries the save history across.
 
