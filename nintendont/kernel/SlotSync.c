@@ -19,7 +19,67 @@
 #include "slotsync/sha256.h"
 
 extern int dbgprintf(const char *fmt, ...);
-#define sslog dbgprintf
+
+/* Diagnostics for a client with nowhere to print.
+ *
+ * dbgprintf reaches a USB Gecko, and /ndebug.log only when Nintendont's own
+ * NIN_CFG_LOG is on AND a hardware register check inside it passes. On a
+ * console with neither, a runtime sync that never got off the ground is
+ * indistinguishable from one that started and had nothing to push -- which is
+ * exactly the position this was debugged from. So everything logged is also
+ * kept in RAM and written to /slotsync/runtime.log, which depends on neither.
+ *
+ * Flushed at shutdown and nowhere else. Nintendont builds FatFs with
+ * _FS_REENTRANT 0, so it is not thread safe -- and the DI thread is streaming
+ * the game off the same card. Writing this log from the worker mid-game wedged
+ * the console at the Nintendo screen, which is a far worse bug than the one it
+ * was added to diagnose. Everything is therefore held in RAM until exit. */
+#define sslog SlotSync_Log
+
+#define SS_LOG_PATH "/slotsync/runtime.log"
+#define SS_LOG_MAX  8192
+
+static char logBuf[SS_LOG_MAX];
+static u32 logLen;
+static int logDirty;
+
+void SlotSync_Log(const char *fmt, ...)
+{
+	char line[256];
+	va_list args;
+	int n;
+
+	va_start(args, fmt);
+	n = _vsprintf(line, fmt, args);
+	va_end(args);
+	if (n <= 0) {
+		return;
+	}
+
+	dbgprintf("%s", line);
+
+	if (logLen + (u32)n < SS_LOG_MAX) {
+		memcpy(logBuf + logLen, line, (u32)n);
+		logLen += (u32)n;
+		logDirty = 1;
+	}
+}
+
+static void ss_log_flush(void)
+{
+	FIL fd;
+	UINT wrote;
+
+	if (!logDirty || logLen == 0) {
+		return;
+	}
+	logDirty = 0;
+	if (f_open_char(&fd, SS_LOG_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+		return;
+	}
+	f_write(&fd, logBuf, (UINT)logLen, &wrote);
+	f_close(&fd);
+}
 
 /* HW_TIMER ticks per millisecond. The register increments about every 526.7 ns
  * (kernel/global.h), so 1 ms is a shade under 1899 ticks. Kept as a multiplier
@@ -31,6 +91,10 @@ extern int dbgprintf(const char *fmt, ...);
 #define SS_HANDOFF_PATH "/slotsync/runtime.txt"
 
 #define SS_CFG_MAX 2048
+
+/* How long SlotSync_Init may wait for DHCP before letting the game boot.
+ * See the note at the call site. */
+#define SS_INIT_NET_BUDGET_MS 6000
 
 /* A 16 MiB card is 16384 chunks, one bit each. */
 #define SS_BITMAP_BYTES 2048
@@ -59,6 +123,14 @@ static ssnet net;
 static ss_client client;
 static u8 bitmap[SS_BITMAP_BYTES] ALIGNED(32);
 static char fileBuf[SS_CFG_MAX] ALIGNED(32);
+
+/* Whether ss_connect has succeeded. File scope because SlotSync_Init makes the
+ * first attempt itself -- see the comment where it does. */
+static int netConnected;
+
+/* A push moved a card on; the handoff file is owed. Written at shutdown by
+ * the main thread, never by the worker. */
+static volatile int handoffPending;
 
 static volatile u32 workerRunning;
 static volatile u32 workerStop;
@@ -235,6 +307,9 @@ static int ss_should_push(int slot)
 			       cfg.cooldown_ms * SS_TICKS_PER_MS);
 }
 
+/* Defined below; the push re-establishes the connection before transferring. */
+static int ss_connect(void);
+
 static void ss_push_slot(int slot)
 {
 	ss_slot *s = &slots[slot];
@@ -263,17 +338,92 @@ static void ss_push_slot(int slot)
 	sslog("SlotSync: pushing %s slot %c, %u KiB, parent v%u\r\n", s->game_id,
 	      slot + 'A', size / 1024, s->parent);
 
+	/* Fresh trace budget, so that if the per-datagram trace is ever turned
+	 * back on it spends itself on the push rather than on the handshake
+	 * that precedes it. */
+	ssnet_trace_reset();
+
+	{
+		u32 live = ssnet_live_ip();
+
+		sslog("SlotSync: interface now %u.%u.%u.%u%s\r\n",
+		      (live >> 24) & 0xFF, (live >> 16) & 0xFF,
+		      (live >> 8) & 0xFF, live & 0xFF,
+		      live == 0 ? " -- GONE" : "");
+	}
+
+	/* Build a fresh socket for every push.
+	 *
+	 * The interface is up and IOS answers GETHOSTID at this moment, so the
+	 * stack is alive -- but this socket has been sitting idle since the
+	 * HELLO, thirty to sixty seconds ago while the game loaded and was
+	 * played. A HELLO that always works because it is the first thing the
+	 * socket ever does, and a push that usually does not because it is the
+	 * next thing minutes later, is what an idle socket quietly going stale
+	 * looks like: sendto still reports the bytes accepted and nothing
+	 * leaves.
+	 *
+	 * A socket and a HELLO cost one round trip against a card transfer of
+	 * two thousand, so this is cheap insurance even if the diagnosis is
+	 * wrong. */
+	ssnet_close(&net);
+	netConnected = 0;
+	if (ss_connect() != 0) {
+		sslog("SlotSync: could not reconnect for the push\r\n");
+		s->dirty = 1;
+		s->pushed_at = read32(HW_TIMER);
+		return;
+	}
+	netConnected = 1;
+
 	workerBusy = 1;
 	rc = ss_push(&client, s->game_id, (u8)slot, image, size, s->parent,
 		     s->parent + 1, bitmap, sizeof(bitmap), &assigned);
 	workerBusy = 0;
 
+	/* A lost commit ACK is not a failed push.
+	 *
+	 * The server commits the version and drops the staging buffer in the
+	 * same breath. If its final ACK does not reach us we retransmit
+	 * PUSH_END, it finds no staging, and answers STAGING_EXPIRED -- so a
+	 * transfer that is already safely committed reports as a failure. The
+	 * card then keeps its old parent, pushes again on the next save, and is
+	 * told 409 by a server that is simply ahead of us.
+	 *
+	 * Asking where the head is settles it. If it sits exactly where this
+	 * push would have put it, the bytes are the ones we sent. */
+	if (rc != SS_OK && client.last_error_code == SS_NACK_STAGING_EXPIRED) {
+		uint32_t head = 0;
+		uint32_t head_size = 0;
+
+		if (ss_head(&client, s->game_id, (u8)slot, &head, &head_size) == SS_OK
+		    && head == s->parent + 1) {
+			sslog("SlotSync: %s: commit ACK lost, but the server is on "
+			      "v%u -- our push landed\r\n", s->game_id, (u32)head);
+			assigned = head;
+			rc = SS_OK;
+		}
+	}
+
 	if (rc == SS_OK) {
 		s->parent = (u32)assigned;
 		s->pushed_any = 1;
 		s->pushed_at = read32(HW_TIMER);
-		sslog("SlotSync: %s is now v%u\r\n", s->game_id, (u32)assigned);
-		ss_write_handoff();
+		sslog("SlotSync: %s is now v%u (%u sends refused)\r\n",
+		      s->game_id, (u32)assigned, net.dropped);
+		/* Do NOT write the handoff here.
+		 *
+		 * This runs on the worker, and Nintendont builds FatFs with
+		 * _FS_REENTRANT 0 while the DI thread streams the game off the
+		 * same card -- writing from here is what wedged the console when
+		 * the log tried it. It never fired before only because no push
+		 * had ever succeeded.
+		 *
+		 * Shutdown writes it instead, on the main thread. The file
+		 * exists for the next launcher run, so exit is soon enough. A
+		 * reset skips it and the launcher then pushes against a stale
+		 * parent and is told 409 -- which is a refusal, not a loss. */
+		handoffPending = 1;
 		return;
 	}
 
@@ -307,11 +457,14 @@ static int ss_connect(void)
 	u8 seed[8];
 	u32 now = read32(HW_TIMER);
 	int i;
+	int rc;
 
 	if (ssnet_bring_up((int)cfg.net_timeout_ms) != 0) {
+		sslog("SlotSync: network did not come up\r\n");
 		return -1;
 	}
 	if (ssnet_open(&net, cfg.server, cfg.port) != 0) {
+		sslog("SlotSync: cannot open a socket to the server\r\n");
 		return -1;
 	}
 	net.pace_every = cfg.pace_every;
@@ -337,18 +490,67 @@ static int ss_connect(void)
 		transport.send = ssnet_send;
 		transport.recv = ssnet_recv;
 		transport.ctx = &net;
+		/* A device id of our own, derived from the configured one.
+		 *
+		 * The launcher and this client are two different clients on one
+		 * console, and they were sharing an identity. The server's
+		 * replay cache is keyed per device with a 120 s window, and the
+		 * launcher says HELLO seconds before the game starts -- so a
+		 * nonce these two happen to agree on inside that window is
+		 * dropped silently, which is indistinguishable from the server
+		 * being unreachable and blocks the read for ever.
+		 *
+		 * Separating them also settles which client pushed a version,
+		 * which has cost several rounds of guessing from the outside. */
 		ss_client_init(&client, &transport, (const u8 *)cfg.psk, cfg.psk_len,
-			       cfg.device_id, seed);
+			       cfg.device_id ^ 0x8000000000000000ull, seed);
 	}
 	client.timeout_ms = cfg.timeout_ms;
 	client.max_rounds = cfg.rounds;
 
-	if (ss_hello(&client, NULL, NULL) != SS_OK) {
-		sslog("SlotSync: server did not answer HELLO\r\n");
+	/* A short deadline for the HELLO only.
+	 *
+	 * The configured 12 rounds of 2 s means up to 24 s before a failed
+	 * HELLO reports anything, and a session shorter than that ends with the
+	 * log stopping mid-attempt, which reads as a hang. The server is on the
+	 * same LAN and answers in milliseconds when it answers at all.
+	 *
+	 * It is restored below before anything else runs. Leaving it clamped
+	 * gave the push four rounds of one second to move two megabytes and
+	 * wait on a server allocating a staging buffer for it -- which timed
+	 * out, and looked like the push failing rather than like an impatient
+	 * client. */
+	if (client.timeout_ms > 1000) {
+		client.timeout_ms = 1000;
+	}
+	if (client.max_rounds > 4) {
+		client.max_rounds = 4;
+	}
+
+	/* Say so before blocking. A HELLO retries for rounds x timeout -- 24 s
+	 * at the shipped settings -- and without this line an attempt still in
+	 * flight and one that failed look identical in the log. */
+	sslog("SlotSync: id %08x%08x psk %u bytes, boot %u, tick %08x\r\n",
+	      (u32)((cfg.device_id ^ 0x8000000000000000ull) >> 32),
+	      (u32)(cfg.device_id ^ 0x8000000000000000ull),
+	      (u32)cfg.psk_len, bootTime, now);
+	sslog("SlotSync: saying hello to %u.%u.%u.%u:%u\r\n",
+	      (cfg.server >> 24) & 0xFF, (cfg.server >> 16) & 0xFF,
+	      (cfg.server >> 8) & 0xFF, cfg.server & 0xFF, (u32)cfg.port);
+
+	rc = ss_hello(&client, NULL, NULL);
+	if (rc != SS_OK) {
+		sslog("SlotSync: no HELLO answer: rc %d, nack 0x%02x\r\n",
+		      rc, (u32)client.last_error_code);
 		ssnet_close(&net);
 		return -1;
 	}
-	sslog("SlotSync: server reachable, runtime sync armed\r\n");
+	/* Back to what the config asks for, now that the handshake is done. */
+	client.timeout_ms = cfg.timeout_ms;
+	client.max_rounds = cfg.rounds;
+
+	sslog("SlotSync: server reachable, runtime sync armed (%d ms x %d)\r\n",
+	      client.timeout_ms, client.max_rounds);
 	return 0;
 }
 
@@ -392,7 +594,6 @@ static int ss_establish_lineage(int slot)
 
 static u32 SlotSyncWorker(void *arg)
 {
-	int connected = 0;
 	int backoff_ms = 2000;
 
 	(void)arg;
@@ -401,9 +602,11 @@ static u32 SlotSyncWorker(void *arg)
 	while (!workerStop) {
 		int slot;
 
-		if (!connected) {
-			if (ss_connect() == 0) {
-				connected = 1;
+		if (!netConnected) {
+			int rc = ss_connect();
+
+			if (rc == 0) {
+				netConnected = 1;
 				backoff_ms = 2000;
 			} else {
 				/* Back off to 60 s. A console with no server on
@@ -439,8 +642,9 @@ static u32 SlotSyncWorker(void *arg)
 		mdelay(250);
 	}
 
-	if (connected) {
+	if (netConnected) {
 		ssnet_close(&net);
+		netConnected = 0;
 	}
 	workerRunning = 0;
 	return 0;
@@ -505,11 +709,106 @@ int SlotSync_Init(void)
 		return -1;
 	}
 
+	/* Make the first connection attempt here, on the main thread, before the
+	 * game is running.
+	 *
+	 * Not for the connection's sake -- the worker retries on its own -- but
+	 * because this is the only point at which the log can be written. FatFs
+	 * is built _FS_REENTRANT 0 and the DI thread owns it from the moment the
+	 * game starts, so the worker can never touch the card; and the shutdown
+	 * flush is on Nintendont's clean-exit path, which a reset skips. Without
+	 * this, a console that is reset reports nothing at all, which is the
+	 * position every attempt at diagnosing this has started from.
+	 *
+	 * Bounded, because it delays the game's boot by however long it takes to
+	 * fail. */
+	{
+		/* Bring the interface up here, and nothing else.
+		 *
+		 * This is the only point at which the log can be written -- the
+		 * worker must never touch FatFs while the game runs -- so the
+		 * step whose failures needed observing happens here. It is fast
+		 * once it works: 1.5 s to a DHCP address.
+		 *
+		 * The socket and the HELLO stay on the worker. Doing those here
+		 * too meant init could sit for the interface timeout plus twelve
+		 * two-second HELLO rounds before the game was allowed to start,
+		 * which reads as a console wedged after "Init CARD ... Done!".
+		 * ss_connect calls bring_up again and it short-circuits on the
+		 * address this leaves behind. */
+		{
+			/* A short budget, not the configured one.
+			 *
+			 * Everything here happens before the game is allowed to
+			 * boot, and on a console with no network at all the full
+			 * runtime_net_timeout_ms of 20 s is spent right here, in
+			 * silence. Nobody playing offline should pay that.
+			 *
+			 * Bring-up takes 1.5 s on the Wii and 2.5 s on the Wii U
+			 * when it works, so this is generous for the case that
+			 * succeeds and quick for the one that cannot. Nothing is
+			 * lost by giving up early: ss_connect on the worker tries
+			 * again with the real timeout, off the boot path, and if the
+			 * interface came up in the meantime bring-up short-circuits
+			 * on GETHOSTID. */
+			int up = ssnet_bring_up(SS_INIT_NET_BUDGET_MS);
+
+			sslog("SlotSync: network %s at init\r\n",
+			      up == 0 ? "up" : "down, worker will retry");
+		}
+		ss_log_flush();
+	}
+
 	slotSyncThread = do_thread_create(SlotSyncWorker,
 					  (u32 *)&__slotsync_stack_addr,
 					  (u32)(&__slotsync_stack_size), 0x50);
 	thread_continue(slotSyncThread);
 	return 0;
+}
+
+/* Called from Nintendont's main loop.
+ *
+ * The worker cannot touch FatFs -- _FS_REENTRANT 0, and the DI thread owns the
+ * card -- so everything it logs sits in RAM until a main-thread caller writes
+ * it out. Tying that to card saves and clean exits meant a reset threw the
+ * whole session away, and which of the two ways a run ended decided whether
+ * anything could be diagnosed at all.
+ *
+ * Rate limited, and a no-op unless something was actually logged, so a quiet
+ * session costs one comparison per iteration. */
+void SlotSync_Poll(void)
+{
+	static u32 lastFlush;
+
+	if (!workerRunning) {
+		return;
+	}
+	/* Not while a transfer is running.
+	 *
+	 * This writes the log from the main loop every three seconds, and a
+	 * push keeps it dirty the whole time -- so a two-thousand-datagram
+	 * transfer came with repeated FatFs writes to the very card the DI
+	 * thread is streaming the game from. The console crashed twice while
+	 * loading a scene mid-push, and this is the part of that picture we put
+	 * there. Diagnostics are not worth a crash now that the transfers work.
+	 *
+	 * The handoff still goes out, because that one matters. */
+	if (workerBusy) {
+		return;
+	}
+	if (!logDirty && !handoffPending) {
+		return;
+	}
+	if (lastFlush != 0 && TimerDiffTicks(lastFlush) < 3000u * SS_TICKS_PER_MS) {
+		return;
+	}
+	lastFlush = read32(HW_TIMER);
+
+	if (handoffPending) {
+		handoffPending = 0;
+		ss_write_handoff();
+	}
+	ss_log_flush();
 }
 
 void SlotSync_NotifyCardSaved(int slot)
@@ -519,6 +818,25 @@ void SlotSync_NotifyCardSaved(int slot)
 	}
 	slots[slot].dirty = 1;
 	slots[slot].dirty_at = read32(HW_TIMER);
+
+	/* Get the log and any owed handoff onto the card while we are here.
+	 *
+	 * This runs on the main thread, called from GCNCard_Save the moment it
+	 * has finished writing the card out -- so FatFs is in use by this very
+	 * thread already and there is no safer point in a running game.
+	 *
+	 * Doing it here rather than only at shutdown is what makes both files
+	 * survive a reset. Nintendont's exit combo is B+Z+R+Down and is easy to
+	 * miss, and everything the worker did was being lost with it.
+	 *
+	 * The push for this save has not happened yet, so what lands is the
+	 * previous one's outcome. A session with two saves in it therefore
+	 * reports the first push, which is all the diagnosis needs. */
+	if (handoffPending) {
+		handoffPending = 0;
+		ss_write_handoff();
+	}
+	ss_log_flush();
 }
 
 int SlotSync_Busy(void)
@@ -544,4 +862,11 @@ void SlotSync_Shutdown(void)
 	if (workerRunning) {
 		sslog("SlotSync: worker still busy at exit, abandoning transfer\r\n");
 	}
+
+	/* Main thread, worker stopped: the one safe moment to touch the card. */
+	if (handoffPending) {
+		handoffPending = 0;
+		ss_write_handoff();
+	}
+	ss_log_flush();
 }

@@ -19,11 +19,15 @@ from .inifile import IniFile
 
 log = logging.getLogger("slotsync.dolphin")
 
-#: `SlotA`/`SlotB` in [Core] are EXIDeviceType values. These are the three that
-#: matter here; anything else means the slot is not a memory card at all.
+#: `SlotA`/`SlotB` in [Core] are Dolphin EXIDeviceType values, and the two that
+#: matter here are easy to transpose. Confirmed against a real installation:
+#: a Dolphin showing `SlotA = 8` was reading and writing `GC/USA/Card A/*.gci`
+#: and ignoring `MemcardAPath` entirely. Getting these the wrong way round is
+#: silent -- `point_at` decides the slot is already fine, writes the path, and
+#: the game goes on saving into the folder while `push` reports no changes.
 EXI_NONE = 255
-EXI_MEMORY_CARD = 8
-EXI_MEMORY_CARD_FOLDER = 9
+EXI_MEMORY_CARD = 1
+EXI_MEMORY_CARD_FOLDER = 8
 
 SLOT_KEYS = {0: ("SlotA", "MemcardAPath"), 1: ("SlotB", "MemcardBPath")}
 SLOT_NAMES = {0: "A", 1: "B"}

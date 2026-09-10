@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,9 +27,31 @@ def _opt(args, name, default=None):
     return getattr(args, name, default)
 
 
-def _configure_logging(verbose: bool) -> None:
+def _configure_logging(verbose: bool, log_file: str | None = None) -> None:
+    """Console output stays bare; a log file gets timestamps.
+
+    Unattended, "pushed" on its own is nearly useless -- the question is always
+    *when*, and whether anything happened at all since. A file also outlives the
+    console window, which is how the first run of this ended up unexplained.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+
+    if log_file:
+        path = Path(log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=[
+                logging.FileHandler(path, encoding="utf-8"),
+                logging.StreamHandler(sys.stderr),
+            ],
+        )
+        return
+
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=level,
         format="%(message)s",
         stream=sys.stderr,
     )
@@ -49,6 +72,8 @@ def cmd_setup(config: Config, args) -> int:
     )
     print(f"  cards     {config.cards_dir}")
     print(f"  slot      {config.slot}")
+    device = f"{config.device:#018x}" if config.device else None
+    print(f"  device    {device or 'unset -- pushes land unattributed'}")
 
     user_dir = config.user_dir or default_user_dir()
     print(f"  dolphin   {user_dir or 'NOT FOUND -- pass --user-dir'}")
@@ -155,6 +180,38 @@ def cmd_use(config: Config, args) -> int:
     return 0
 
 
+def cmd_launch(config: Config, args) -> int:
+    """Bring the card up to date, then start Dolphin."""
+    syncer = Syncer(config)
+    slot = _opt(args, "slot") or config.slot
+
+    if is_running():
+        print("Dolphin is already running.", file=sys.stderr)
+        return 1
+
+    game_id = _opt(args, "game_id") or syncer.current_game(slot)
+    if game_id is None:
+        print(
+            "Dolphin's memory card path does not name a game this manages.\n"
+            "Say which one: launch GXXE01",
+            file=sys.stderr,
+        )
+        return 1
+
+    outcome = syncer.pull(game_id, slot)
+    syncer.point_dolphin_at(game_id, slot)
+    print(f"{outcome.game_id} slot {outcome.slot}: {outcome.action} v{outcome.version}")
+
+    exe = config.dolphin_exe or find_executable()
+    if exe is None:
+        print("no Dolphin executable; pass --dolphin-exe to setup", file=sys.stderr)
+        return 1
+
+    print(f"starting {exe}")
+    subprocess.Popen([str(exe)], cwd=str(Path(exe).parent))
+    return 0
+
+
 def cmd_play(config: Config, args) -> int:
     syncer = Syncer(config)
     pulled, pushed = syncer.play(
@@ -253,6 +310,11 @@ def _add_global_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument(
+        "--log-file",
+        default=argparse.SUPPRESS,
+        help="also append timestamped lines here; worth it for `watch`",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -288,6 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
         _add_global_options(one)
         one.set_defaults(func=func)
 
+    launch = sub.add_parser(
+        "launch", help="pull, then start Dolphin -- no stale card to fork from"
+    )
+    launch.add_argument("game_id", nargs="?", default=argparse.SUPPRESS)
+    launch.set_defaults(func=cmd_launch)
+
     play = sub.add_parser("play", help="pull, launch Dolphin, push on exit")
     play.add_argument("game_id")
     _add_global_options(play)
@@ -308,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    _configure_logging(bool(_opt(args, "verbose")))
+    _configure_logging(bool(_opt(args, "verbose")), _opt(args, "log_file"))
 
     try:
         config = Config.load(

@@ -31,12 +31,35 @@ typedef struct {
     int count;
 } wii_state;
 
-/* Scan `dir` for GAMEID.raw files. Fills `out` and returns how many were found,
- * or -1 if the directory cannot be read. */
+/* Scan `dir` for card images and fill `out` with their file name stems -- the
+ * part before ".raw", which is four characters for a card Nintendont wrote and
+ * six for one that came from the PC side. Returns how many were found, or -1 if
+ * the directory cannot be read.
+ *
+ * A stem is a file name, not a server key. Use wii_saves_game_id to turn one
+ * into the six-character ID the server versions cards by.
+ */
 int wii_saves_scan(const char *dir, char out[][WII_GAME_ID_LEN + 1], int cap);
 
-/* Read a whole card into `buffer`. Returns its size, or -1. */
-long wii_saves_read(const char *dir, const char *game_id, uint8_t *buffer, size_t cap);
+/* Resolve the server's six-character ID for a card already read into `card`.
+ * Returns 1 on success, or 0 when the card carries no save belonging to this
+ * game and therefore cannot be identified -- see core/memcard.h for why that
+ * has to be a skip rather than a guess. */
+int wii_saves_game_id(const uint8_t *card, long size, const char *stem,
+                      char out[WII_GAME_ID_LEN + 1]);
+
+/* Read a whole card into `buffer`, by file name stem. Returns its size, or -1. */
+long wii_saves_read(const char *dir, const char *stem, uint8_t *buffer, size_t cap);
+
+/* Copy a card aside as `stem`.raw.bak before something overwrites it.
+ *
+ * Pulling the server's version on a conflict replaces a card that has local
+ * play in it. That is a human's decision to make, but it should not be an
+ * irreversible one -- PLAN.md section 7 is about never silently losing a save,
+ * and "the user pressed A" is not much comfort if it was the wrong A. Returns
+ * 0, or -1 if the copy could not be written, in which case do not overwrite. */
+int wii_saves_backup(const char *dir, const char *stem, const uint8_t *data,
+                     size_t len);
 
 /* Write a card. Writes to a temporary file and renames, so an interrupted
  * write cannot leave the console a half-card to boot from. Returns 0 or -1. */

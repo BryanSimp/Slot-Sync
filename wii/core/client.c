@@ -29,6 +29,7 @@ void ss_client_init(ss_client *c, const ss_transport *transport, const uint8_t *
     c->device_id = device_id;
     c->timeout_ms = 2000;
     c->max_rounds = 8;
+    c->pull_window = SS_PULL_WINDOW;
     if (seed != NULL) {
         memcpy(c->nonce_seed, seed, 8);
     }
@@ -398,18 +399,47 @@ int ss_pull(ss_client *c, const char *game_id, uint8_t slot, uint32_t want_versi
     uint32_t version = 0;
     uint32_t chunks = 0;
     size_t needed = 0;
-    size_t request_len = 0;
+    size_t request_len;
     uint32_t request_base = 0;
+    uint32_t outstanding = 0;
+    uint32_t previous_missing = 0xFFFFFFFFu;
+    uint32_t window;
+    uint32_t budget = 0;
+    uint32_t rounds = 0;
+    uint32_t i;
     int initialised = 0;
-    int round;
+    int stalled = 0;
     int rc;
 
-    for (round = 0; round < c->max_rounds; round++) {
+    /* Ask for a windowful at a time, never for the whole card at once.
+     *
+     * A PULL_REQ is answered with a burst, and the console's receive buffer
+     * holds about forty datagrams. Asking for a 2 MiB card's 2048 chunks in one
+     * request means the burst overruns that buffer and the round salvages one
+     * bufferful: measured on the real console, forty-five chunks per round,
+     * which needs fifty rounds the client is not given. A window the buffer can
+     * hold turns the same transfer into sixty-four rounds that each land whole.
+     */
+    window = c->pull_window > 0 ? (uint32_t)c->pull_window : SS_PULL_WINDOW;
+    if (window > (uint32_t)SS_MAX_PAYLOAD * 8u) {
+        window = (uint32_t)SS_MAX_PAYLOAD * 8u;
+    }
+
+    /* The first round cannot consult the received bitmap, because the card's
+     * size is not known until the server's ack. So it asks for the first window
+     * and lets the server clip whatever runs past the end of a smaller card. */
+    memset(request, 0, sizeof(request));
+    for (i = 0; i < window; i++) {
+        ss_bitmap_set(request, sizeof(request), request_base, i);
+    }
+    request_len = (size_t)((window - 1u) / 8u) + 1u;
+
+    for (;;) {
         ss_header_init(&h, SS_PULL_REQ, c->device_id, game_id, slot);
         h.card_version = want_version;
         h.sequence = request_base;
 
-        rc = emit(c, &h, request_len ? request : NULL, request_len);
+        rc = emit(c, &h, request, request_len);
         if (rc != SS_OK) {
             return rc;
         }
@@ -453,6 +483,21 @@ int ss_pull(ss_client *c, const char *game_id, uint8_t slot, uint32_t want_versi
                 }
                 memset(bitmap, 0, needed);
                 initialised = 1;
+
+                /* Four passes over the card, plus the caller's allowance for
+                 * rounds that achieve nothing, is a ceiling no healthy transfer
+                 * comes near. It exists so that a server which answers but
+                 * never completes cannot hold the console forever. */
+                budget = (chunks / window + 1u) * 4u + (uint32_t)c->max_rounds;
+
+                /* How much of what we asked for can actually arrive: chunks
+                 * past the end of the card never will. */
+                outstanding = 0;
+                for (i = 0; i < chunks; i++) {
+                    if (ss_bitmap_test(request, request_len, request_base, i)) {
+                        outstanding++;
+                    }
+                }
             }
 
             if (in.msg_type != SS_PULL_CHUNK) {
@@ -466,19 +511,40 @@ int ss_pull(ss_client *c, const char *game_id, uint8_t slot, uint32_t want_versi
             if ((size_t)in.offset + payload_len > (size_t)total) {
                 continue;
             }
-            memcpy(out + in.offset, payload, payload_len);
-            ss_bitmap_set(bitmap, bitmap_cap, 0, in.sequence);
+            if (!ss_bitmap_test(bitmap, bitmap_cap, 0, in.sequence)) {
+                memcpy(out + in.offset, payload, payload_len);
+                ss_bitmap_set(bitmap, bitmap_cap, 0, in.sequence);
+                if (outstanding > 0
+                    && ss_bitmap_test(request, request_len, request_base, in.sequence)) {
+                    outstanding--;
+                }
+            }
+
+            /* The window is full. Stopping here rather than waiting out the
+             * per-reply timeout is what makes many small rounds affordable:
+             * without it every round would cost two idle seconds. */
+            if (outstanding == 0) {
+                break;
+            }
+        }
+
+        if (budget != 0 && ++rounds > budget) {
+            return SS_ERR_GAVE_UP;
         }
 
         if (!initialised) {
-            continue; /* nothing came back at all; ask again */
+            /* Nothing came back at all. Ask again with the same window. */
+            if (++stalled >= c->max_rounds) {
+                return SS_ERR_GAVE_UP;
+            }
+            continue;
         }
 
         {
             uint32_t first_missing;
             uint32_t missing = count_missing(bitmap, bitmap_cap, chunks, &first_missing);
-            uint32_t window;
-            uint32_t i;
+            uint32_t picked = 0;
+            uint32_t highest;
 
             if (missing == 0) {
                 if (out_size != NULL) {
@@ -490,24 +556,42 @@ int ss_pull(ss_client *c, const char *game_id, uint8_t slot, uint32_t want_versi
                 return SS_OK;
             }
 
-            /* Ask again for just the gaps. One window per round is enough: the
-             * next round re-checks and asks for whatever is still absent. */
-            window = (uint32_t)(SS_MAX_PAYLOAD * 8u);
-            request_base = (first_missing / window) * window;
-            request_len = SS_MAX_PAYLOAD;
-            memset(request, 0, request_len);
-            for (i = 0; i < chunks; i++) {
-                if (!ss_bitmap_test(bitmap, bitmap_cap, 0, i)) {
-                    ss_bitmap_set(request, request_len, request_base, i);
-                }
+            /* The give-up rule counts rounds that achieve nothing, not rounds.
+             * A window that lands completely is progress however many are left,
+             * so a whole card now takes as many rounds as it takes. */
+            if (missing < previous_missing) {
+                stalled = 0;
+            } else if (++stalled >= c->max_rounds) {
+                return SS_ERR_GAVE_UP;
             }
+            previous_missing = missing;
+
+            /* The next window starts at the first gap and names up to `window`
+             * of the chunks still absent. Sizing the payload to the last bit
+             * actually set keeps the usual sequential case down to a few bytes.
+             */
+            request_base = first_missing;
+            highest = first_missing;
+            memset(request, 0, sizeof(request));
+            for (i = first_missing; i < chunks && picked < window; i++) {
+                if (ss_bitmap_test(bitmap, bitmap_cap, 0, i)) {
+                    continue;
+                }
+                if (i - request_base >= (uint32_t)SS_MAX_PAYLOAD * 8u) {
+                    break; /* past what one request bitmap can express */
+                }
+                ss_bitmap_set(request, sizeof(request), request_base, i);
+                highest = i;
+                picked++;
+            }
+            request_len = (size_t)((highest - request_base) / 8u) + 1u;
+            outstanding = picked;
+
             /* Name the version explicitly from now on, so a push landing
              * mid-pull cannot switch us to a different card. */
             want_version = version;
         }
     }
-
-    return SS_ERR_GAVE_UP;
 }
 
 /* --- strings ------------------------------------------------------------ */

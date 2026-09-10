@@ -6,12 +6,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../core/client.h"   /* SS_PULL_WINDOW, so the default lives in one place */
+
 void wii_config_defaults(wii_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->port = 9977;
     cfg->timeout_ms = 2000;
     cfg->rounds = 12;
+    cfg->conflict_timeout_ms = 30000;
+    cfg->pull_window = SS_PULL_WINDOW;
+    cfg->pace_every = 16;
+    cfg->pace_us = 20000;
     cfg->autoboot = 1;
     strcpy(cfg->saves_dir, WII_SAVES_DIR);
     strcpy(cfg->nintendont, "sd:/apps/Nintendont/boot.dol");
@@ -88,6 +94,14 @@ int wii_config_load(wii_config *cfg, const char *path, char *error, int error_ca
             cfg->timeout_ms = atoi(value);
         } else if (strcmp(key, "rounds") == 0) {
             cfg->rounds = atoi(value);
+        } else if (strcmp(key, "conflict_timeout_ms") == 0) {
+            cfg->conflict_timeout_ms = atoi(value);
+        } else if (strcmp(key, "pull_window") == 0) {
+            cfg->pull_window = atoi(value);
+        } else if (strcmp(key, "pace_every") == 0) {
+            cfg->pace_every = atoi(value);
+        } else if (strcmp(key, "pace_us") == 0) {
+            cfg->pace_us = atoi(value);
         } else if (strcmp(key, "autoboot") == 0) {
             cfg->autoboot = (strcmp(value, "0") != 0 && strcmp(value, "false") != 0);
         }

@@ -22,16 +22,34 @@ So this daemon makes the PC speak the console's unit instead: one card per game,
 with `MemcardAPath` in `Dolphin.ini` repointed before each game runs. Sync stays
 byte-exact raw-to-raw, and nothing ever edits the inside of a card.
 
+### Cards carry a region in their name
+
+`GXXE01.USA.raw`, not `GXXE01.raw`. Dolphin does not use `MemcardAPath`
+literally -- it treats it as a base and inserts the running game's region before
+the extension. A card named without one is never opened: Dolphin creates its own
+blank 128 Mbit card under the name it wanted, plays against that, and the synced
+card sits beside it collecting nothing while every save goes somewhere the sync
+never looks.
+
+Its own default, `MemoryCardA.USA.raw`, is the tell -- a name that already
+carries a region is used as-is. The region comes from the fourth character of
+the game id, which is the country code.
+
 ## Setup
 
 ```bash
 python -m slotsync_dolphin setup \
     --server http://your-nas:8080 \
-    --token "$SLOTSYNC_TOKEN"
+    --token "$SLOTSYNC_TOKEN" \
+    --device 0x5043000000000001
 ```
 
 That writes `~/.slotsync/dolphin.json` so later commands need no flags. Cards
 live in `~/.slotsync/cards/` unless you pass `--cards-dir`.
+
+`--device` is any u64 you like, distinct per machine. It is what makes the web
+UI say which box pushed a version; without it every push from a PC is
+attributed to nobody while the consoles name themselves.
 
 ## Use
 
@@ -53,6 +71,32 @@ python -m slotsync_dolphin watch
 
 `play` pushes in a `finally` block, so a crashed emulator still gets you the save
 that did make it to disk.
+
+
+## Pushing while you play
+
+Double-click `slotsync-watch.cmd`, or run `watch`, and leave it going -- or put
+a shortcut to it in `shell:startup` and forget about it. It syncs both ways:
+
+- **Pushes** whenever a card stops changing, so an in-game save reaches the
+  server without quitting Dolphin, the same way the Nintendont kernel client
+  does it on the console.
+- **Pulls** whatever the server has moved on, but only while Dolphin is closed.
+  Dolphin holds the card in memory and writes it back out, so a card replaced
+  underneath a running instance is undone at the next in-game save -- and the
+  save that replaced it goes with it. Closed is also exactly when a pull is
+  useful: the gap between finishing on a console and starting on the PC.
+
+A card with unpushed local play is left alone rather than pulled over. That is
+a conflict, and conflicts are a human's decision.
+
+Verified end to end: a card changed underneath the watcher was pushed about ten
+seconds later, and the version the server committed hashes identically to the
+file on disk.
+
+It never overwrites. If another device moved the card on while you were playing,
+the push is refused as a conflict, logged, and your card is left alone -- settle
+it in the web UI.
 
 ## Things worth knowing
 

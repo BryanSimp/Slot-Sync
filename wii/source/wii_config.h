@@ -28,6 +28,10 @@ typedef struct {
     char nintendont[WII_MAX_STR]; /* .dol to chainload */
     int timeout_ms;
     int rounds;
+    int conflict_timeout_ms;    /* 0 waits for a button for ever */
+    int pull_window;            /* chunks asked for per pull round */
+    int pace_every;             /* datagrams to send before pausing; 0 = never */
+    int pace_us;                /* how long to pause for */
     int autoboot;               /* chainload without waiting for a button */
 } wii_config;
 

@@ -41,6 +41,10 @@ class Config:
     #: unchanged before it is considered finished being written.
     poll_interval: float = 2.0
     settle_seconds: float = 5.0
+    #: How often `watch` asks the server whether anything has moved. Much
+    #: slower than the push poll: a push is watching a local file and costs
+    #: nothing, while this is a request per card.
+    pull_interval: float = 30.0
 
     def require_token(self) -> str:
         if not self.token:
@@ -100,6 +104,11 @@ class Config:
             payload["user_dir"] = str(self.user_dir)
         if self.dolphin_exe:
             payload["dolphin_exe"] = str(self.dolphin_exe)
+        if self.device is not None:
+            # Without this the web UI attributes every push from this PC to
+            # nobody, while the consoles name themselves. It is not a secret
+            # and it has to survive across runs to be worth anything.
+            payload["device"] = self.device
         CONFIG_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         # The token is in here, so keep it off other users' eyes where the OS

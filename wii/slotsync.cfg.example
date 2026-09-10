@@ -46,9 +46,36 @@ runtime_cooldown_ms = 30000
 # How long to wait for DHCP before giving up and backing off.
 runtime_net_timeout_ms = 20000
 
-# Send pacing: pause for `pace_us` after every `pace_every` datagrams. The
-# defaults offer 1600 datagrams/sec, under the server's own SLOTSYNC_UDP_RATE
-# of 2048/sec. Raising these without raising that does not make a card arrive
-# sooner -- it makes the server drop chunks and the console resend them.
-runtime_pace_every = 8
-runtime_pace_us = 5000
+# Send pacing: pause for `pace_us` after every `pace_every` datagrams.
+#
+# Not about the server's rate limit, which is what these were first set from.
+# IOS's send path is the constraint: unpaced it refuses about three quarters of
+# a card's datagrams, and every refusal costs a retransmission round. 64 per
+# 160 ms is 400/sec, measured on hardware as the rate at which a 2 MiB card
+# lands with zero sends refused -- roughly five seconds of radio time, thin
+# enough that the running game does not notice it.
+runtime_pace_every = 64
+runtime_pace_us = 160000
+
+# ---------------------------------------------------------------------------
+# Transfer tuning for the launcher. The kernel has its own runtime_* pacing
+# above; these are what the launcher uses before the game starts.
+# ---------------------------------------------------------------------------
+
+# How many chunks a single pull round asks for.
+#
+# The server answers a PULL_REQ with an unsolicited burst, and the console's
+# receive buffer holds around forty datagrams -- so asking for a whole 2 MiB
+# card at once means the burst overruns it and the round salvages a bufferful.
+# Measured: forty-five chunks recovered per round, so a 2 MiB card never
+# finished. Asking for a window the buffer can hold makes every round land
+# whole. Raise it if pulls are slow and nothing is being dropped; lower it if
+# a round comes back short.
+pull_window = 32
+
+# Send pacing, same idea in the other direction: pause for `pace_us` after
+# every `pace_every` datagrams. Without it the IOS send path refuses about
+# three quarters of a card's chunks and they all come back as retransmission
+# rounds. 0 disables the pause.
+pace_every = 16
+pace_us = 20000

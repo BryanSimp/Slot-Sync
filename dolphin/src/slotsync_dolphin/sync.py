@@ -279,8 +279,76 @@ class Syncer:
                 log.error("push failed", extra={"game_id": game_id, "detail": str(exc)})
         return outcomes
 
+    def current_game(self, slot: str | None = None) -> str | None:
+        """The game Dolphin's memory card path names, if it is one of ours.
+
+        Dolphin has exactly one `MemcardAPath`, so this is the only game it can
+        play correctly right now. None if it points somewhere we do not manage,
+        which is the case worth telling someone about rather than guessing at.
+        """
+        slot = (slot or self.config.slot).upper()
+        try:
+            dolphin = self.dolphin_config()
+        except SyncError:
+            return None
+
+        path = dolphin.memcard_path(1 if slot == "B" else 0)
+        if path is None:
+            return None
+        try:
+            path = path.resolve()
+        except OSError:
+            return None
+        if path.parent != self.cards.root.resolve():
+            return None
+
+        for game_id, known_slot in self.cards.known_games():
+            if known_slot != slot:
+                continue
+            if self.cards.path_for(game_id, known_slot).resolve() == path:
+                return game_id
+        return None
+
+    def pull_idle_cards(self) -> list[PullOutcome]:
+        """Bring local cards up to the server's head, when it is safe to.
+
+        Only while Dolphin is closed. It keeps the card in memory and writes it
+        back out, so a card replaced underneath a running instance is undone the
+        next time the game saves -- and the save that replaced it is lost.
+
+        A card with unpushed local play is left alone: `pull` refuses it, which
+        is a conflict for a human rather than something to resolve here.
+        """
+        outcomes = []
+
+        if is_running():
+            return outcomes
+
+        for game_id, slot in self.cards.known_games():
+            try:
+                detail = self.client.card(game_id, slot)
+            except ServerError as exc:
+                log.error(
+                    "head query failed",
+                    extra={"game_id": game_id, "detail": str(exc)},
+                )
+                continue
+            if detail is None:
+                continue
+            if detail["head"]["version"] <= self.cards.state(game_id, slot).version:
+                continue
+
+            try:
+                outcomes.append(self.pull(game_id, slot, create=False))
+            except (ServerError, SyncError) as exc:
+                log.warning(
+                    "not pulling",
+                    extra={"game_id": game_id, "slot": slot, "detail": str(exc)},
+                )
+        return outcomes
+
     def watch(self) -> None:
-        """Poll forever. Ctrl-C to stop."""
+        """Poll forever, both directions. Ctrl-C to stop."""
         log.info(
             "watching for changes",
             extra={
@@ -288,6 +356,23 @@ class Syncer:
                 "interval": self.config.poll_interval,
             },
         )
+        next_pull = 0.0
+        was_running = False
+
         while True:
             self.watch_once()
+
+            # Dolphin just let go of the cards. Do not wait out the rest of the
+            # interval: this is the moment someone is most likely to go and
+            # start it again, and starting it against a stale card is how a
+            # save gets forked.
+            running = is_running()
+            just_closed = was_running and not running
+            was_running = running
+
+            now = time.monotonic()
+            if just_closed or now >= next_pull:
+                next_pull = now + self.config.pull_interval
+                self.pull_idle_cards()
+
             time.sleep(self.config.poll_interval)

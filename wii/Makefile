@@ -51,7 +51,9 @@ export TMP      := $(CURDIR)/$(BUILD)
 export TEMP     := $(CURDIR)/$(BUILD)
 
 CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
-export OFILES := $(CFILES:.c=.o)
+# The chainload stub is assembly because it has to be position-independent.
+SFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.S)))
+export OFILES := $(CFILES:.c=.o) $(SFILES:.S=.o)
 
 export INCLUDE  := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
                    $(foreach dir,$(PORTLIBS),-I$(dir)/include) \

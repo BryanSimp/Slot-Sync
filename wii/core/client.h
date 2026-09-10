@@ -23,6 +23,11 @@
 
 #include "protocol.h"
 
+/* Chunks a pull asks for per round. The card arrives as an unsolicited burst
+ * and the console holds only about forty datagrams of it, so a window larger
+ * than the receive buffer is thrown away rather than queued. */
+#define SS_PULL_WINDOW 32
+
 /* How the client reaches the network. Both return < 0 on error; `recv` returns
  * 0 on timeout, which is a normal outcome rather than a failure. */
 typedef struct {
@@ -45,6 +50,7 @@ typedef struct {
 
     int timeout_ms;  /* per reply; 2000 is a sane default */
     int max_rounds;  /* retransmission rounds before giving up; 8 is sane */
+    int pull_window; /* chunks per pull round; 0 means SS_PULL_WINDOW */
 
     /* Populated after a call, for reporting. */
     uint32_t last_head;      /* on SS_CONFLICT, the server's head version */

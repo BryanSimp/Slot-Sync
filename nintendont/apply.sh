@@ -46,7 +46,7 @@ cp "$HERE/kernel/SlotSyncNet.h"   "$ND/kernel/"
 
 echo "==> vendoring the protocol core from wii/core"
 mkdir -p "$ND/kernel/slotsync"
-for f in protocol.c protocol.h client.c client.h sha256.c sha256.h; do
+for f in protocol.c protocol.h client.c client.h sha256.c sha256.h memcard.c memcard.h; do
 	cp "$REPO/wii/core/$f" "$ND/kernel/slotsync/$f"
 done
 
@@ -54,7 +54,7 @@ echo "==> applying the hooks"
 if grep -q "SlotSync_Init" "$ND/kernel/main.c"; then
 	echo "    already applied, skipping"
 else
-	(cd "$ND" && patch -p1 --batch < "$HERE/patches/0001-slotsync-hooks.patch")
+	(cd "$ND" && patch -p1 --batch --binary < "$HERE/patches/0001-slotsync-hooks.patch")
 fi
 
 cat <<'EOF'

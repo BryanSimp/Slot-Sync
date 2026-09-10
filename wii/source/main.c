@@ -31,6 +31,7 @@
 #include "../core/client.h"
 #include "../core/sha256.h"
 #include "wii_config.h"
+#include "wii_drc.h"
 #include "wii_dol.h"
 #include "wii_net.h"
 #include "wii_saves.h"
@@ -50,6 +51,9 @@ static void video_init(void)
     VIDEO_Init();
     WPAD_Init();
     PAD_Init();
+    /* Answers false on a real Wii, where there is no GamePad to find. Asking
+     * costs one pattern match against IOS's memory. */
+    WiiDRC_Init();
 
     mode = VIDEO_GetPreferredMode(NULL);
     framebuffer = MEM_K0_TO_K1(SYS_AllocateFramebuffer(mode));
@@ -66,18 +70,133 @@ static void video_init(void)
     }
 }
 
+/* What the person in front of the television just pressed.
+ *
+ * Four channels rather than one: a Wii Remote does not reliably come up as
+ * player one, and on a Wii U it usually does not. The Classic Controller masks
+ * are how libogc reports a Classic -- and how the Wii U GamePad arrives when
+ * this runs as an injected Wii U title, which is the only way the GamePad is an
+ * input device at all on that console. They share the button word with the
+ * remote's own buttons, in its top sixteen bits, so one read covers both.
+ *
+ * A GameCube pad has no HOME, so START stands in for it.
+ *
+ * The Wii U GamePad is a third thing again, and neither WPAD nor PAD can see
+ * it: in vWii it is not a Wii input device at all, and its state lives in IOS's
+ * memory rather than on any bus libogc talks to. Launched from a Wii U menu
+ * channel that is the only controller in the room, so without wii_drc.c the
+ * launcher looks dead while Nintendont, which has always read it, works fine.
+ *
+ * GameCube controllers on a Wii U are a fourth case and are still not handled:
+ * vWii has no controller ports, so a pad on the official USB adapter reaches
+ * Nintendont through its own USB HID stack and nothing here. Use the GamePad or
+ * a Wii Remote. */
+enum { BTN_A = 1, BTN_B = 2, BTN_EXIT = 4 };
+
+static unsigned buttons_down(void)
+{
+    unsigned out = 0;
+    int chan;
+
+    WPAD_ScanPads();
+    PAD_ScanPads();
+
+    if (WiiDRC_Inited() && WiiDRC_Connected()) {
+        u32 drc;
+
+        WiiDRC_ScanPads();
+        drc = WiiDRC_ButtonsDown();
+
+        if (drc & WIIDRC_BUTTON_A) {
+            out |= BTN_A;
+        }
+        if (drc & WIIDRC_BUTTON_B) {
+            out |= BTN_B;
+        }
+        if (drc & WIIDRC_BUTTON_HOME) {
+            out |= BTN_EXIT;
+        }
+    }
+
+    for (chan = 0; chan < 4; chan++) {
+        u32 wii = WPAD_ButtonsDown(chan);
+        u16 gcn = PAD_ButtonsDown(chan);
+
+        if ((wii & (WPAD_BUTTON_A | WPAD_CLASSIC_BUTTON_A)) || (gcn & PAD_BUTTON_A)) {
+            out |= BTN_A;
+        }
+        if ((wii & (WPAD_BUTTON_B | WPAD_CLASSIC_BUTTON_B)) || (gcn & PAD_BUTTON_B)) {
+            out |= BTN_B;
+        }
+        if ((wii & (WPAD_BUTTON_HOME | WPAD_CLASSIC_BUTTON_HOME))
+            || (gcn & PAD_BUTTON_START)) {
+            out |= BTN_EXIT;
+        }
+    }
+    return out;
+}
+
+/* A or B. Returns 1 for A, 0 for B; HOME/START still leaves.
+ *
+ * Only used for a conflict, which PLAN.md section 7 says is a human's call.
+ * The console is the only place that human is standing when it happens.
+ *
+ * `timeout_ms` of 0 waits for ever. Anything else answers B when it runs out,
+ * because there is a real case where nobody can answer at all: launched from a
+ * Wii U menu channel the console is in vWii, where the GamePad is not an input
+ * device, and a prompt with no reachable button is indistinguishable from a
+ * hang. B is the safe side of that -- it keeps the card that is here and leaves
+ * the conflict standing for the web UI. Timing out into A would overwrite a
+ * card because nobody was holding a Wii Remote, which is the whole failure this
+ * project exists to prevent. */
+static int ask_a_or_b(int timeout_ms)
+{
+    u64 started = gettime();
+    int last_left = -1;
+
+    for (;;) {
+        unsigned pressed = buttons_down();
+
+        if (pressed & BTN_A) {
+            return 1;
+        }
+        if (pressed & BTN_B) {
+            return 0;
+        }
+        if (pressed & BTN_EXIT) {
+            printf("returning to the loader\n");
+            exit(0);
+        }
+
+        if (timeout_ms > 0) {
+            int gone = (int)ticks_to_millisecs(diff_ticks(started, gettime()));
+            int left = (timeout_ms - gone + 999) / 1000;
+
+            if (left <= 0) {
+                printf("\r         no answer -- keeping this card%*s\n", 20, "");
+                return 0;
+            }
+            /* Redraw only when the second changes: this console's console
+             * output is a framebuffer, and printing every vsync is visible. */
+            if (left != last_left) {
+                last_left = left;
+                printf("\r         B in %d s unless you choose ", left);
+            }
+        }
+        VIDEO_WaitVSync();
+    }
+}
+
 static void wait_for_button(const char *prompt)
 {
     printf("\n%s\n", prompt);
     for (;;) {
-        WPAD_ScanPads();
-        PAD_ScanPads();
-        if ((WPAD_ButtonsDown(0) & WPAD_BUTTON_A)
-            || (PAD_ButtonsDown(0) & PAD_BUTTON_A)) {
+        unsigned pressed = buttons_down();
+
+        if (pressed & BTN_A) {
             return;
         }
-        if ((WPAD_ButtonsDown(0) & WPAD_BUTTON_HOME)
-            || (PAD_ButtonsDown(0) & PAD_BUTTON_START)) {
+        if (pressed & BTN_EXIT) {
             printf("returning to the loader\n");
             exit(0);
         }
@@ -93,22 +212,42 @@ static int digests_match(const uint8_t *a, const uint8_t *b)
 /* One card, both directions. Returns 0 if nothing went wrong; a conflict counts
  * as "went wrong" only in the sense that it is reported and skipped -- it is
  * never resolved here. PLAN.md section 7: a human chooses, in the web UI. */
+/* `stem` is the file name on the SD card, which is four characters for a card
+ * Nintendont wrote. `game_id` is the six the server keys by. They are not the
+ * same string and must not be used interchangeably: the file lives under the
+ * stem, every protocol call takes the id. */
 static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
-                    const char *game_id, uint8_t *card, uint8_t *bitmap)
+                    const char *stem, uint8_t *card, uint8_t *bitmap)
 {
-    wii_card_state *entry = wii_state_get(state, game_id, 0);
+    char game_id[WII_GAME_ID_LEN + 1];
+    wii_card_state *entry;
     uint8_t digest[SHA256_DIGEST_SIZE];
     uint32_t server_version = 0;
     uint32_t server_size = 0;
     long size;
     int rc;
 
+    size = wii_saves_read(cfg->saves_dir, stem, card, CARD_BUFFER_BYTES);
+    if (size <= 0) {
+        printf("  %s: cannot read the card\n", stem);
+        return -1;
+    }
+
+    /* The maker code has to come off the card, and a card with nothing saved
+     * on it yet has no entry to read it from. Pushing it space-padded would
+     * key a different card on the server than Dolphin uses for the same game
+     * and split one lineage in two, so it waits for a first save instead. */
+    if (!wii_saves_game_id(card, size, stem, game_id)) {
+        printf("  %s: nothing saved on it yet, so nothing identifies it\n",
+               stem);
+        return 0;
+    }
+
+    entry = wii_state_get(state, game_id, 0);
     if (entry == NULL) {
         printf("  %s: too many cards to track\n", game_id);
         return -1;
     }
-
-    size = wii_saves_read(cfg->saves_dir, game_id, card, CARD_BUFFER_BYTES);
 
     rc = ss_head(client, game_id, 0, &server_version, &server_size);
     if (rc != SS_OK && client->last_error_code != SS_NACK_UNKNOWN_CARD) {
@@ -132,23 +271,46 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
                          entry->version + 1, bitmap, BITMAP_BYTES, &assigned);
 
             if (rc == SS_ERR_CONFLICT) {
-                /* Someone else moved this card on while we were playing. Say
-                 * so and leave both sides alone. */
-                printf("  %s: CONFLICT, server is on v%u\n", game_id,
-                       client->last_head);
-                printf("         your save is safe on the SD card; choose in the web UI\n");
-                return -1;
-            }
-            if (rc != SS_OK) {
+                /* Someone else moved this card on while we were playing.
+                 * Never decide this here -- but the person who can decide
+                 * is standing in front of the console, so ask them rather
+                 * than making them go to a web UI to do the obvious thing.
+                 *
+                 * Taking the server's version replaces a card with local
+                 * play in it, so it is copied aside first and the pull is
+                 * abandoned if that copy cannot be written. */
+                printf("  %s: CONFLICT -- server is on v%u, yours came from v%u\n",
+                       game_id, client->last_head, entry->version);
+                printf("         A: take the server's v%u (this card -> %s.raw.bak)\n",
+                       client->last_head, stem);
+                printf("         B: keep this card, decide later in the web UI\n");
+
+                if (!ask_a_or_b(cfg->conflict_timeout_ms)) {
+                    printf("  %s: kept yours; nothing sent\n", game_id);
+                    return -1;
+                }
+                if (wii_saves_backup(cfg->saves_dir, stem, card,
+                                     (size_t)size) != 0) {
+                    printf("  %s: could not write the backup -- keeping yours\n",
+                           game_id);
+                    return -1;
+                }
+                printf("  %s: backed up to %s.raw.bak\n", game_id, stem);
+                /* Fall through to the pull below, which is already written. */
+                server_version = client->last_head;
+            } else if (rc != SS_OK) {
                 printf("  %s: push failed: %s\n", game_id, ss_strerror(rc));
                 return -1;
+            } else {
+                /* Only when the push actually landed. On a conflict
+                 * `assigned` is zero and server_version already holds the
+                 * head we are about to pull. */
+                entry->version = assigned;
+                entry->known = 1;
+                memcpy(entry->sha256, digest, SHA256_DIGEST_SIZE);
+                server_version = assigned;
+                printf("  %s: pushed as v%u\n", game_id, assigned);
             }
-
-            entry->version = assigned;
-            entry->known = 1;
-            memcpy(entry->sha256, digest, SHA256_DIGEST_SIZE);
-            server_version = assigned;
-            printf("  %s: pushed as v%u\n", game_id, assigned);
         }
     }
 
@@ -164,7 +326,7 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
             printf("  %s: pull failed: %s\n", game_id, ss_strerror(rc));
             return -1;
         }
-        if (wii_saves_write(cfg->saves_dir, game_id, card, got_size) != 0) {
+        if (wii_saves_write(cfg->saves_dir, stem, card, got_size) != 0) {
             printf("  %s: could not write the card to the SD card\n", game_id);
             return -1;
         }
@@ -195,7 +357,7 @@ static void sync_all(ss_client *client, const wii_config *cfg, wii_state *state)
         return;
     }
     if (found == 0) {
-        printf("no GAMEID.raw files in %s yet\n", cfg->saves_dir);
+        printf("no card images in %s yet\n", cfg->saves_dir);
         return;
     }
 
@@ -253,16 +415,27 @@ int main(int argc, char **argv)
     printf("saves    %s\n", cfg.saves_dir);
 
     printf("network  connecting...\n");
-    if (wii_net_init(ip, (int)sizeof(ip)) != 0) {
-        printf("network  FAILED -- check the Wii's internet settings\n");
+    rc = wii_net_init(ip, (int)sizeof(ip));
+    if (rc != 0) {
+        printf("network  FAILED (%d) -- check the Wii's internet settings\n", rc);
         wait_for_button("Press A to boot Nintendont without syncing.");
         wii_dol_run(cfg.nintendont, argc, argv);
         return 1;
     }
     printf("network  %s\n\n", ip);
 
-    if (wii_net_open(&sock, cfg.server, cfg.port) != 0) {
-        printf("cannot open a socket to %s\n", cfg.server);
+    rc = wii_net_open(&sock, cfg.server, cfg.port);
+    if (rc != 0) {
+        /* Name the code. -6 is ENXIO from net_socket, meaning the IOS
+         * socket driver never opened -- a different problem from the
+         * server being unreachable, and the two printed the same line. */
+        if (rc == WII_NET_EBADADDR) {
+            printf("server \"%s\" is not a dotted quad\n", cfg.server);
+        } else if (rc == -6) {
+            printf("no socket: the IOS network driver did not open (-6)\n");
+        } else {
+            printf("cannot open a socket to %s (%d)\n", cfg.server, rc);
+        }
         wait_for_button("Press A to boot Nintendont without syncing.");
         wii_dol_run(cfg.nintendont, argc, argv);
         return 1;
@@ -291,10 +464,20 @@ int main(int argc, char **argv)
                    cfg.device_id, seed);
     client.timeout_ms = cfg.timeout_ms;
     client.max_rounds = cfg.rounds;
+    client.pull_window = cfg.pull_window;
+    sock.pace_every = cfg.pace_every;
+    sock.pace_us = cfg.pace_us;
 
     rc = ss_hello(&client, &server_time, &server_version);
     if (rc != SS_OK) {
         printf("server did not answer: %s\n", ss_strerror(rc));
+        /* Which direction failed, and with what. SS_ERR_TRANSPORT covers
+         * both a send and a receive failing, and they are different bugs. */
+        if (sock.last_op != 0) {
+            printf("  last %s failed with %d\n",
+                   sock.last_op == 's' ? "send" :
+                   sock.last_op == 'p' ? "poll" : "recv", sock.last_err);
+        }
         if (client.last_error_code == SS_NACK_BAD_HMAC) {
             printf("  the pre-shared key does not match the server's\n");
         }

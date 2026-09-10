@@ -2,35 +2,71 @@
 
 #include "wii_saves.h"
 
+#include "memcard.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int is_card_name(const char *name, char game_id[WII_GAME_ID_LEN + 1])
+/* Accept both four- and six-character stems.
+ *
+ * Six is what the PC side writes. Four is what Nintendont writes, because the
+ * game ID it carries is a u32 -- the card on a real console is GC6E.raw, not
+ * GC6E01.raw. Insisting on six meant no card Nintendont had ever written was
+ * visible to this program at all. The missing two characters come off the card
+ * itself later; see wii_saves_game_id. */
+static int is_card_name(const char *name, char stem[WII_GAME_ID_LEN + 1])
 {
     size_t len = strlen(name);
+    size_t stem_len;
     size_t i;
 
-    /* GAMEID.raw and nothing else. Nintendont writes exactly that. */
-    if (len != WII_GAME_ID_LEN + 4) {
+    if (len == WII_GAME_ID_LEN + 4) {
+        stem_len = WII_GAME_ID_LEN;
+    } else if (len == 4 + 4) {
+        stem_len = 4;
+    } else {
         return 0;
     }
-    if (strcmp(name + WII_GAME_ID_LEN, ".raw") != 0
-        && strcmp(name + WII_GAME_ID_LEN, ".RAW") != 0) {
+
+    if (strcmp(name + stem_len, ".raw") != 0
+        && strcmp(name + stem_len, ".RAW") != 0) {
         return 0;
     }
-    for (i = 0; i < WII_GAME_ID_LEN; i++) {
+    for (i = 0; i < stem_len; i++) {
         char c = name[i];
         int alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
                     || (c >= '0' && c <= '9');
         if (!alnum) {
             return 0;
         }
-        game_id[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        stem[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
     }
-    game_id[WII_GAME_ID_LEN] = '\0';
+    stem[stem_len] = '\0';
     return 1;
+}
+
+int wii_saves_game_id(const uint8_t *card, long size, const char *stem,
+                      char out[WII_GAME_ID_LEN + 1])
+{
+    char code4[4];
+    size_t len = strlen(stem);
+    size_t i;
+
+    /* Already six characters: it came from the PC side, which knows the maker
+     * code, so there is nothing to look up. */
+    if (len == WII_GAME_ID_LEN) {
+        memcpy(out, stem, WII_GAME_ID_LEN + 1);
+        return 1;
+    }
+    if (len != 4 || size <= 0) {
+        return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        code4[i] = stem[i];
+    }
+    return ss_card_game_id(card, (uint32_t)size, code4, out);
 }
 
 int wii_saves_scan(const char *dir, char out[][WII_GAME_ID_LEN + 1], int cap)
@@ -43,9 +79,9 @@ int wii_saves_scan(const char *dir, char out[][WII_GAME_ID_LEN + 1], int cap)
         return -1;
     }
     while ((entry = readdir(handle)) != NULL && found < cap) {
-        char game_id[WII_GAME_ID_LEN + 1];
-        if (is_card_name(entry->d_name, game_id)) {
-            memcpy(out[found], game_id, WII_GAME_ID_LEN + 1);
+        char stem[WII_GAME_ID_LEN + 1];
+        if (is_card_name(entry->d_name, stem)) {
+            memcpy(out[found], stem, WII_GAME_ID_LEN + 1);
             found++;
         }
     }
@@ -53,20 +89,20 @@ int wii_saves_scan(const char *dir, char out[][WII_GAME_ID_LEN + 1], int cap)
     return found;
 }
 
-static void card_path(char *out, size_t cap, const char *dir, const char *game_id,
+static void card_path(char *out, size_t cap, const char *dir, const char *stem,
                       const char *suffix)
 {
-    snprintf(out, cap, "%s/%s.raw%s", dir, game_id, suffix);
+    snprintf(out, cap, "%s/%s.raw%s", dir, stem, suffix);
 }
 
-long wii_saves_read(const char *dir, const char *game_id, uint8_t *buffer, size_t cap)
+long wii_saves_read(const char *dir, const char *stem, uint8_t *buffer, size_t cap)
 {
     char path[256];
     FILE *file;
     long size;
     size_t got;
 
-    card_path(path, sizeof(path), dir, game_id, "");
+    card_path(path, sizeof(path), dir, stem, "");
     file = fopen(path, "rb");
     if (file == NULL) {
         return -1;
@@ -86,7 +122,30 @@ long wii_saves_read(const char *dir, const char *game_id, uint8_t *buffer, size_
     return got == (size_t)size ? size : -1;
 }
 
-int wii_saves_write(const char *dir, const char *game_id, const uint8_t *data,
+int wii_saves_backup(const char *dir, const char *stem, const uint8_t *data,
+                     size_t len)
+{
+    char path[256];
+    FILE *file;
+    size_t written;
+
+    /* stem.raw.bak: long enough that is_card_name will never mistake it for a
+     * card and try to sync it. */
+    card_path(path, sizeof(path), dir, stem, ".bak");
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return -1;
+    }
+    written = fwrite(data, 1, len, file);
+    fclose(file);
+    if (written != len) {
+        remove(path);
+        return -1;
+    }
+    return 0;
+}
+
+int wii_saves_write(const char *dir, const char *stem, const uint8_t *data,
                     size_t len)
 {
     char temp[256];
@@ -94,8 +153,8 @@ int wii_saves_write(const char *dir, const char *game_id, const uint8_t *data,
     FILE *file;
     size_t written;
 
-    card_path(temp, sizeof(temp), dir, game_id, ".tmp");
-    card_path(final, sizeof(final), dir, game_id, "");
+    card_path(temp, sizeof(temp), dir, stem, ".tmp");
+    card_path(final, sizeof(final), dir, stem, "");
 
     file = fopen(temp, "wb");
     if (file == NULL) {
