@@ -10,7 +10,11 @@ import pytest
 
 from slotsync_dolphin.cards import CardDirectory, sha256_hex
 from slotsync_dolphin.client import Conflict
-from slotsync_dolphin.dolphin import EXI_MEMORY_CARD, DolphinConfig, DolphinPaths
+from slotsync_dolphin.dolphin import (
+    EXI_MEMORY_CARD,
+    DolphinConfig,
+    DolphinPaths,
+)
 from slotsync_dolphin.sync import Syncer, SyncError
 
 from .conftest import make_card
@@ -176,7 +180,43 @@ def test_pointing_dolphin_enables_a_slot_that_was_switched_off(syncer, config):
     syncer.pull(game)
     syncer.point_dolphin_at(game, "A")
 
-    assert DolphinConfig(DolphinPaths(user_dir=config.user_dir)).slot_device(0) == 8
+    after = DolphinConfig(DolphinPaths(user_dir=config.user_dir))
+    assert after.slot_device(0) == EXI_MEMORY_CARD
+
+
+#: What a real Dolphin writes for `SlotA` when the slot is set to GCI-folder
+#: mode. A literal on purpose: the constants in `slotsync_dolphin.dolphin` are
+#: what this test exists to check, so expressing it in terms of them would make
+#: the test agree with whatever they happen to say.
+REAL_DOLPHIN_GCI_FOLDER = 8
+
+
+def test_pointing_dolphin_takes_a_slot_out_of_gci_folder_mode(syncer, config):
+    """A slot in GCI-folder mode ignores MemcardAPath and keeps saving into
+    GC/<region>/Card A/*.gci.
+
+    This is worse than a slot switched off, because everything looks like it
+    worked: the path is written, Dolphin loads, the game saves -- into the
+    folder. The card the daemon watches never changes, so `push` reports no
+    local changes forever and the play is quietly stranded. Caught on a real
+    installation after a session was lost to it.
+    """
+    ini = config.user_dir / "Config" / "Dolphin.ini"
+    ini.write_text(
+        ini.read_text(encoding="utf-8").replace(
+            "SlotA = 255", f"SlotA = {REAL_DOLPHIN_GCI_FOLDER}"
+        ),
+        encoding="utf-8",
+    )
+
+    game = unique("gcifolder")
+    syncer.pull(game)
+    syncer.point_dolphin_at(game, "A")
+
+    after = DolphinConfig(DolphinPaths(user_dir=config.user_dir))
+    assert after.slot_device(0) != REAL_DOLPHIN_GCI_FOLDER
+    assert after.slot_device(0) == EXI_MEMORY_CARD
+    assert after.memcard_path(0) == syncer.cards.path_for(game, "A").resolve()
 
 
 def test_slot_b_uses_its_own_keys_and_filename(syncer, config):

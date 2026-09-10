@@ -49,6 +49,8 @@ def cmd_setup(config: Config, args) -> int:
     )
     print(f"  cards     {config.cards_dir}")
     print(f"  slot      {config.slot}")
+    device = f"{config.device:#018x}" if config.device else None
+    print(f"  device    {device or 'unset -- pushes land unattributed'}")
 
     user_dir = config.user_dir or default_user_dir()
     print(f"  dolphin   {user_dir or 'NOT FOUND -- pass --user-dir'}")

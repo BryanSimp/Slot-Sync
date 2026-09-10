@@ -27,11 +27,16 @@ byte-exact raw-to-raw, and nothing ever edits the inside of a card.
 ```bash
 python -m slotsync_dolphin setup \
     --server http://your-nas:8080 \
-    --token "$SLOTSYNC_TOKEN"
+    --token "$SLOTSYNC_TOKEN" \
+    --device 0x5043000000000001
 ```
 
 That writes `~/.slotsync/dolphin.json` so later commands need no flags. Cards
 live in `~/.slotsync/cards/` unless you pass `--cards-dir`.
+
+`--device` is any u64 you like, distinct per machine. It is what makes the web
+UI say which box pushed a version; without it every push from a PC is
+attributed to nobody while the consoles name themselves.
 
 ## Use
 
@@ -53,6 +58,22 @@ python -m slotsync_dolphin watch
 
 `play` pushes in a `finally` block, so a crashed emulator still gets you the save
 that did make it to disk.
+
+
+## Pushing while you play
+
+Double-click `slotsync-watch.cmd`, or run `watch`, and leave it going. It polls
+the cards directory, waits for a card to stop changing, and pushes it -- so an
+in-game save reaches the server without quitting Dolphin, the same way the
+Nintendont kernel client does it on the console.
+
+Verified end to end: a card changed underneath the watcher was pushed about ten
+seconds later, and the version the server committed hashes identically to the
+file on disk.
+
+It never overwrites. If another device moved the card on while you were playing,
+the push is refused as a conflict, logged, and your card is left alone -- settle
+it in the web UI.
 
 ## Things worth knowing
 
