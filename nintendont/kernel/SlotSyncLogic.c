@@ -2,13 +2,11 @@
 
 #include "SlotSyncLogic.h"
 
-#include <string.h>
+/* core/memcard.h, reached through -I: the kernel build adds -Islotsync
+ * where apply.sh vendors it, the host tests add -I../../wii/core. */
+#include "memcard.h"
 
-/* Directory block offsets, from docs/MEMCARD.md -- verified against Dolphin's
- * GCMemcard.cpp rather than recalled. */
-#define SSL_DIR_OFFSET   0x2000
-#define SSL_DIR_ENTRIES  127
-#define SSL_DENTRY_SIZE  0x40
+#include <string.h>
 
 static int ssl_is_space(char c)
 {
@@ -163,13 +161,24 @@ void ssl_config_defaults(ssl_config *cfg)
     cfg->quiet_ms = 4000;
     cfg->cooldown_ms = 30000;
     cfg->net_timeout_ms = 20000;
-    /* Datagrams per pause, and how long to pause. 8 per 5 ms is 1600/sec,
-     * which sits under the server's own default UDP rate limit of 2048/sec
-     * (SLOTSYNC_UDP_RATE) with room to spare. Going faster does not make a
-     * card arrive sooner: it makes the server drop chunks and the client
-     * retransmit them. Raise both only alongside the server's limit. */
-    cfg->pace_every = 8;
-    cfg->pace_us = 5000;
+    /* Send pacing: pause pace_us after every pace_every datagrams.
+     *
+     * These were first derived from the server's own limit -- 8 per 5 ms is
+     * 1600/sec, under SLOTSYNC_UDP_RATE's 2048 -- which turned out to be the
+     * wrong constraint entirely. The server was never the bottleneck. IOS's
+     * send path is: unpaced it refuses roughly three quarters of a card's
+     * datagrams, and every refusal costs a retransmission round.
+     *
+     * 64 per 160 ms is 400/sec, measured on hardware as the rate at which a
+     * 2 MiB card lands with *zero* sends refused. That is about five seconds of
+     * radio time, spread thin enough that the running game does not notice.
+     *
+     * One udelay per 64 datagrams, not per datagram: udelay in this kernel
+     * builds an IOS message queue and a timer per call and tears them down
+     * again, and doing that thousands of times inside a single push is what
+     * crashed the console mid-scene-load. */
+    cfg->pace_every = 64;
+    cfg->pace_us = 160000;
 }
 
 int ssl_config_parse(const char *text, ssl_config *cfg)
@@ -258,38 +267,18 @@ int ssl_state_find(const char *text, const char *game_id, uint8_t slot,
 int ssl_game_id(const uint8_t *card, uint32_t card_size, uint32_t nin_game_id,
                 char out[SSL_GAME_ID_LEN + 1])
 {
-    int i;
+    char code4[4];
 
-    out[0] = (char)((nin_game_id >> 24) & 0xFF);
-    out[1] = (char)((nin_game_id >> 16) & 0xFF);
-    out[2] = (char)((nin_game_id >> 8) & 0xFF);
-    out[3] = (char)(nin_game_id & 0xFF);
-    out[4] = ' ';
-    out[5] = ' ';
-    out[6] = '\0';
+    /* Nintendont keeps the game's four characters packed into a u32; the
+     * shared lookup takes them as characters. That repacking is the only
+     * difference between the two callers, which is why the rest of it lives in
+     * core/ and is compiled into both the launcher and this kernel. */
+    code4[0] = (char)((nin_game_id >> 24) & 0xFF);
+    code4[1] = (char)((nin_game_id >> 16) & 0xFF);
+    code4[2] = (char)((nin_game_id >> 8) & 0xFF);
+    code4[3] = (char)(nin_game_id & 0xFF);
 
-    /* Need at least the header and directory blocks to look at. */
-    if (card == NULL || card_size < SSL_DIR_OFFSET + 0x2000) {
-        return 0;
-    }
-
-    for (i = 0; i < SSL_DIR_ENTRIES; i++) {
-        const uint8_t *entry = card + SSL_DIR_OFFSET + (uint32_t)i * SSL_DENTRY_SIZE;
-
-        /* FF FF FF FF marks an unused entry. */
-        if (entry[0] == 0xFF && entry[1] == 0xFF && entry[2] == 0xFF
-            && entry[3] == 0xFF) {
-            continue;
-        }
-        /* Another game's save, on a card shared between games. */
-        if (memcmp(entry, out, 4) != 0) {
-            continue;
-        }
-        out[4] = (char)entry[4];
-        out[5] = (char)entry[5];
-        return 1;
-    }
-    return 0;
+    return ss_card_game_id(card, card_size, code4, out);
 }
 
 int ssl_should_push(int dirty, int halted, uint32_t since_dirty, uint32_t since_push,

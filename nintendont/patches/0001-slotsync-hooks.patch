@@ -69,17 +69,27 @@ index 304b431..3a3336d 100644
  * Check if the memory cards have changed.
  * @return True if either memory card has changed; false if not.
 diff --git a/kernel/Makefile b/kernel/Makefile
-index 5f65844..302e98f 100644
+index 5f65844..1630e65 100644
 --- a/kernel/Makefile
 +++ b/kernel/Makefile
-@@ -36,7 +36,9 @@ OBJECTS	:= start.o common.o alloc.o GCAM.o JVSIO.o JVSIOMessage.o FST.o DI.o Rea
+@@ -26,7 +26,7 @@ CFLAGS	:= -mbig-endian -O3 -std=gnu89 -g -I. -Wall \
+ 	   -mcpu=arm926ej-s -msoft-float -mfloat-abi=soft \
+ 	   -fdata-sections -ffunction-sections -fno-builtin-toupper -fno-builtin-memcpy \
+ 	   -fno-builtin-memset -fno-builtin-memcmp -fno-builtin-malloc -fno-builtin-free
+-CPPFLAGS := -I. -I../fatfs -I../codehandler
++CPPFLAGS := -I. -Islotsync -I../fatfs -I../codehandler
+ 
+ ASFLAGS	:= -mbig-endian -mcpu=arm926ej-s
+ LDFLAGS	:= -nostartfiles -nodefaultlibs -mbig-endian -Wl,--gc-sections,-T,kernel.ld,-Map,kernel.map -n
+@@ -36,7 +36,10 @@ OBJECTS	:= start.o common.o alloc.o GCAM.o JVSIO.o JVSIOMessage.o FST.o DI.o Rea
  	   Patch.o PatchTimers.o TRI.o PatchWidescreen.o ISO.o Stream.o adp.o \
  	   EXI.o SRAM.o GCNCard.o SI.o HID.o diskio.o Config.o utils_asm.o ES.o NAND.o \
  	   main.o syscalls.o ReadSpeed.o vsprintf.o string.o prs.o \
 -	   SDI.o usb.o usbstorage.o wdvd.o sock.o
 +	   SDI.o usb.o usbstorage.o wdvd.o sock.o \
 +	   SlotSync.o SlotSyncNet.o SlotSyncLogic.o \
-+	   slotsync/protocol.o slotsync/client.o slotsync/sha256.o
++	   slotsync/protocol.o slotsync/client.o slotsync/sha256.o \
++	   slotsync/memcard.o
  LIBS	:= ../fatfs/libfatfs-arm.a be/libc.a be/libgcc.a
  ZIPFILE	:= ../loader/data/kernel.zip
  
@@ -101,7 +111,7 @@ index 77907d1..c390ebe 100644
  
  	code		: ORIGIN = 0x12F00000,	LENGTH = 0x60000
 diff --git a/kernel/main.c b/kernel/main.c
-index fac0829..7560867 100644
+index fac0829..99212ca 100644
 --- a/kernel/main.c
 +++ b/kernel/main.c
 @@ -32,6 +32,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
@@ -125,7 +135,15 @@ index fac0829..7560867 100644
  //Tell PPC side we are ready!
  	cc_ahbMemFlush(1);
  	mdelay(1000);
-@@ -462,6 +469,10 @@ int _main( int argc, char *argv[] )
+@@ -457,11 +464,18 @@ int _main( int argc, char *argv[] )
+ 			Now = read32(HW_TIMER);
+ 			SaveCard = true;
+ 		}
++		/* SlotSync: write out whatever the worker logged, and any handoff
++		 * it owes. Main thread, rate limited, no-op when idle. */
++		SlotSync_Poll();
+ 		sync_before_read((void*)RESET_STATUS, 0x20);
+ 		vu32 reset_status = read32(RESET_STATUS);
  		if (reset_status == 0x1DEA)
  		{
  			dbgprintf("Game Exit\r\n");
@@ -136,3 +154,17 @@ index fac0829..7560867 100644
  			DIFinishAsync();
  			break;
  		}
+diff --git a/kernel/sock.c b/kernel/sock.c
+index 0e176e1..7a8fde5 100644
+--- a/kernel/sock.c
++++ b/kernel/sock.c
+@@ -58,7 +58,8 @@ static ioctlv *SOVec[SO_TOTAL_FDS];
+ static u32 SO_Thread = 0;
+ static u8 *soqueueheap = NULL;
+ static u32 *so_stack;
+-static int sockFd, nwcFd;
++/* SlotSync borrows these; see kernel/SlotSyncNet.c. */
++int sockFd, nwcFd;
+ static int ourCurrentIP;
+ 
+ static u32 SOCKAlarm()

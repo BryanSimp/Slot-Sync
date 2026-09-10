@@ -15,6 +15,8 @@
 #include <stdint.h>
 
 #define SSL_GAME_ID_LEN 6
+/* Same six as core/memcard.h's SS_GAME_ID_LEN, which ssl_game_id writes
+ * through. Kept as its own name so this header stays standalone. */
 #define SSL_PSK_MAX 128
 
 /* Longest deadline accepted from the config file, in ms. Ten minutes times

@@ -31,13 +31,28 @@ int SlotSync_Init(void);
  * Called from GCNCard_Save. */
 void SlotSync_NotifyCardSaved(int slot);
 
+/* Call from the main loop. Writes out anything the worker logged, and any
+ * handoff it owes, at the only point in a running game where FatFs is safe.
+ * Rate limited internally; cheap to call every iteration. */
+void SlotSync_Poll(void);
+
 /* Stop the worker and hand back the version numbers we reached, so the libogc
  * wrapper can pick up the lineage where the kernel left it. Called on game
  * exit. */
 void SlotSync_Shutdown(void);
 
-/* True while a transfer is in flight. EXI.c uses it to avoid saving a card
- * out from under a push. */
+/* True while a transfer is in flight.
+ *
+ * Intended as an interlock so a card is not saved out from under a push -- but
+ * nothing calls it yet, in EXI.c or anywhere else, so no such interlock exists.
+ * A save landing mid-push tears the image; the whole-card digest catches that,
+ * the server refuses it, and ss_push_slot re-arms and retries. Wasteful rather
+ * than dangerous, which is why this is still a TODO and not a defect. */
 int SlotSync_Busy(void);
+
+/* Log a line. Goes to dbgprintf and, independently of whether that reaches
+ * anywhere, to /slotsync/runtime.log. Exposed so the socket layer's trace can
+ * land in the same place rather than in a build nobody has. */
+void SlotSync_Log(const char *fmt, ...);
 
 #endif /* SLOTSYNC_H */

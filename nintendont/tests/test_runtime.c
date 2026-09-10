@@ -73,10 +73,14 @@ static void test_config(void)
     check(cfg.quiet_ms == 2500, "runtime_quiet_ms");
     check(cfg.cooldown_ms == 15000, "runtime_cooldown_ms");
     check(cfg.rounds == 12, "rounds defaults");
-    check(cfg.pace_every == 8, "pacing defaults on");
-    /* The default must stay under the server's own UDP rate limit, which
-     * defaults to 2048 datagrams/sec (SLOTSYNC_UDP_RATE). Sending faster does
-     * not deliver a card sooner, it just gets chunks dropped. */
+    check(cfg.pace_every != 0 && cfg.pace_us != 0, "pacing defaults on");
+    /* 400 datagrams/sec, measured on hardware as the rate at which a 2 MiB card
+     * lands with zero sends refused. IOS's send path is the binding constraint,
+     * not the server: unpaced it refuses about three quarters of a card. */
+    check(cfg.pace_every * 1000000u / cfg.pace_us == 400u,
+          "the default pace is the one hardware sustains");
+    /* And it has to stay under the server's own UDP rate limit too, which
+     * defaults to 2048 datagrams/sec (SLOTSYNC_UDP_RATE). */
     check(cfg.pace_every * 1000000u / cfg.pace_us < 2048u,
           "the default pace sits under the server's UDP rate limit");
 

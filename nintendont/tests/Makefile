@@ -7,6 +7,7 @@
 
 CC      ?= gcc
 CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 -g
+CFLAGS  += -I../../wii/core
 LDLIBS  :=
 
 UNAME := $(shell uname -s 2>/dev/null)
@@ -22,7 +23,7 @@ endif
 
 CORE    := ../../wii/core
 SOURCES := test_runtime.c ../kernel/SlotSyncLogic.c \
-	   $(CORE)/sha256.c $(CORE)/protocol.c $(CORE)/client.c \
+	   $(CORE)/sha256.c $(CORE)/protocol.c $(CORE)/client.c $(CORE)/memcard.c \
 	   ../../wii/tests/host_socket.c
 
 test_runtime: $(SOURCES) ../kernel/SlotSyncLogic.h
