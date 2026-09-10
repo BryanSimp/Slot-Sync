@@ -31,6 +31,7 @@
 #include "../core/client.h"
 #include "../core/sha256.h"
 #include "wii_config.h"
+#include "wii_drc.h"
 #include "wii_dol.h"
 #include "wii_net.h"
 #include "wii_saves.h"
@@ -50,6 +51,9 @@ static void video_init(void)
     VIDEO_Init();
     WPAD_Init();
     PAD_Init();
+    /* Answers false on a real Wii, where there is no GamePad to find. Asking
+     * costs one pattern match against IOS's memory. */
+    WiiDRC_Init();
 
     mode = VIDEO_GetPreferredMode(NULL);
     framebuffer = MEM_K0_TO_K1(SYS_AllocateFramebuffer(mode));
@@ -75,7 +79,18 @@ static void video_init(void)
  * input device at all on that console. They share the button word with the
  * remote's own buttons, in its top sixteen bits, so one read covers both.
  *
- * A GameCube pad has no HOME, so START stands in for it. */
+ * A GameCube pad has no HOME, so START stands in for it.
+ *
+ * The Wii U GamePad is a third thing again, and neither WPAD nor PAD can see
+ * it: in vWii it is not a Wii input device at all, and its state lives in IOS's
+ * memory rather than on any bus libogc talks to. Launched from a Wii U menu
+ * channel that is the only controller in the room, so without wii_drc.c the
+ * launcher looks dead while Nintendont, which has always read it, works fine.
+ *
+ * GameCube controllers on a Wii U are a fourth case and are still not handled:
+ * vWii has no controller ports, so a pad on the official USB adapter reaches
+ * Nintendont through its own USB HID stack and nothing here. Use the GamePad or
+ * a Wii Remote. */
 enum { BTN_A = 1, BTN_B = 2, BTN_EXIT = 4 };
 
 static unsigned buttons_down(void)
@@ -85,6 +100,23 @@ static unsigned buttons_down(void)
 
     WPAD_ScanPads();
     PAD_ScanPads();
+
+    if (WiiDRC_Inited() && WiiDRC_Connected()) {
+        u32 drc;
+
+        WiiDRC_ScanPads();
+        drc = WiiDRC_ButtonsDown();
+
+        if (drc & WIIDRC_BUTTON_A) {
+            out |= BTN_A;
+        }
+        if (drc & WIIDRC_BUTTON_B) {
+            out |= BTN_B;
+        }
+        if (drc & WIIDRC_BUTTON_HOME) {
+            out |= BTN_EXIT;
+        }
+    }
 
     for (chan = 0; chan < 4; chan++) {
         u32 wii = WPAD_ButtonsDown(chan);
