@@ -279,8 +279,46 @@ class Syncer:
                 log.error("push failed", extra={"game_id": game_id, "detail": str(exc)})
         return outcomes
 
+    def pull_idle_cards(self) -> list[PullOutcome]:
+        """Bring local cards up to the server's head, when it is safe to.
+
+        Only while Dolphin is closed. It keeps the card in memory and writes it
+        back out, so a card replaced underneath a running instance is undone the
+        next time the game saves -- and the save that replaced it is lost.
+
+        A card with unpushed local play is left alone: `pull` refuses it, which
+        is a conflict for a human rather than something to resolve here.
+        """
+        outcomes = []
+
+        if is_running():
+            return outcomes
+
+        for game_id, slot in self.cards.known_games():
+            try:
+                detail = self.client.card(game_id, slot)
+            except ServerError as exc:
+                log.error(
+                    "head query failed",
+                    extra={"game_id": game_id, "detail": str(exc)},
+                )
+                continue
+            if detail is None:
+                continue
+            if detail["head"]["version"] <= self.cards.state(game_id, slot).version:
+                continue
+
+            try:
+                outcomes.append(self.pull(game_id, slot, create=False))
+            except (ServerError, SyncError) as exc:
+                log.warning(
+                    "not pulling",
+                    extra={"game_id": game_id, "slot": slot, "detail": str(exc)},
+                )
+        return outcomes
+
     def watch(self) -> None:
-        """Poll forever. Ctrl-C to stop."""
+        """Poll forever, both directions. Ctrl-C to stop."""
         log.info(
             "watching for changes",
             extra={
@@ -288,6 +326,11 @@ class Syncer:
                 "interval": self.config.poll_interval,
             },
         )
+        next_pull = 0.0
         while True:
             self.watch_once()
+            now = time.monotonic()
+            if now >= next_pull:
+                next_pull = now + self.config.pull_interval
+                self.pull_idle_cards()
             time.sleep(self.config.poll_interval)

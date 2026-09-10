@@ -41,6 +41,10 @@ class Config:
     #: unchanged before it is considered finished being written.
     poll_interval: float = 2.0
     settle_seconds: float = 5.0
+    #: How often `watch` asks the server whether anything has moved. Much
+    #: slower than the push poll: a push is watching a local file and costs
+    #: nothing, while this is a request per card.
+    pull_interval: float = 30.0
 
     def require_token(self) -> str:
         if not self.token:

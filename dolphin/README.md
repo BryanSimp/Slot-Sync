@@ -62,10 +62,20 @@ that did make it to disk.
 
 ## Pushing while you play
 
-Double-click `slotsync-watch.cmd`, or run `watch`, and leave it going. It polls
-the cards directory, waits for a card to stop changing, and pushes it -- so an
-in-game save reaches the server without quitting Dolphin, the same way the
-Nintendont kernel client does it on the console.
+Double-click `slotsync-watch.cmd`, or run `watch`, and leave it going -- or put
+a shortcut to it in `shell:startup` and forget about it. It syncs both ways:
+
+- **Pushes** whenever a card stops changing, so an in-game save reaches the
+  server without quitting Dolphin, the same way the Nintendont kernel client
+  does it on the console.
+- **Pulls** whatever the server has moved on, but only while Dolphin is closed.
+  Dolphin holds the card in memory and writes it back out, so a card replaced
+  underneath a running instance is undone at the next in-game save -- and the
+  save that replaced it goes with it. Closed is also exactly when a pull is
+  useful: the gap between finishing on a console and starting on the PC.
+
+A card with unpushed local play is left alone rather than pulled over. That is
+a conflict, and conflicts are a human's decision.
 
 Verified end to end: a card changed underneath the watcher was pushed about ten
 seconds later, and the version the server committed hashes identically to the

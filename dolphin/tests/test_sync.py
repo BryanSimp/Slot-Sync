@@ -249,6 +249,44 @@ def test_watch_ignores_cards_with_no_changes(syncer):
     assert syncer.watch_once() == []
 
 
+def test_watch_pulls_what_the_server_moved_on(syncer, monkeypatch):
+    """The other half of unattended sync: a console pushed while the PC sat
+    idle, and the card should come down without anyone running anything."""
+    game = unique("idlepull")
+    syncer.pull(game)
+    ahead = syncer.cards.read(game, "A")[:]
+    syncer.cards.write(game, "A", ahead[:-1] + bytes([ahead[-1] ^ 0xFF]))
+    pushed = syncer.push(game, "A")
+
+    # Rewind the local side to look like a PC that has not caught up yet.
+    syncer.cards.write(game, "A", ahead)
+    syncer.cards.remember(game, "A", pushed.version - 1, sha256_hex(ahead))
+
+    monkeypatch.setattr("slotsync_dolphin.sync.is_running", lambda: False)
+    outcomes = syncer.pull_idle_cards()
+
+    assert [o.game_id for o in outcomes] == [game]
+    assert syncer.cards.state(game, "A").version == pushed.version
+
+
+def test_watch_never_pulls_under_a_running_dolphin(syncer, monkeypatch):
+    """Dolphin holds the card in memory and writes it back out. A card replaced
+    underneath it is undone at the next in-game save, and whatever was pulled is
+    lost with it -- so this must not happen however far behind the card is."""
+    game = unique("runningpull")
+    syncer.pull(game)
+    original = syncer.cards.read(game, "A")[:]
+    syncer.cards.write(game, "A", original[:-1] + bytes([original[-1] ^ 0xFF]))
+    pushed = syncer.push(game, "A")
+
+    syncer.cards.write(game, "A", original)
+    syncer.cards.remember(game, "A", pushed.version - 1, sha256_hex(original))
+
+    monkeypatch.setattr("slotsync_dolphin.sync.is_running", lambda: True)
+    assert syncer.pull_idle_cards() == []
+    assert syncer.cards.read(game, "A") == original
+
+
 def test_watch_survives_a_conflict_without_overwriting(syncer):
     """One card conflicting must not stop the others, or overwrite anything."""
     game = unique("watch-conflict")
