@@ -189,6 +189,30 @@ Two fixes, both applied:
 The server paces its own pull the same way, 32 chunks per burst with a 2 ms gap
 (`SLOTSYNC_PULL_BURST`, `SLOTSYNC_PULL_BURST_DELAY`).
 
+## Measured on the console: the client must window what it asks for
+
+The same overrun happens in the other direction, and there the receive buffer is not
+ours to enlarge. A Wii asking for a whole 2 MiB card in one `PULL_REQ` gets a 2048-chunk
+burst and keeps about **forty-five of them**; the rest overrun IOS's socket receive
+buffer while the client is still authenticating the first few. Every round then salvages
+one bufferful, so the transfer converges at roughly 45 chunks per round and a 2 MiB card
+never finishes inside any sane round budget. From a real session, the gap counts falling
+2048, 2013, 1947, 1870 ... 987 over the client's 24 rounds, then giving up.
+
+So a client asks for `pull_window` chunks per round (32 by default) rather than for
+everything it is missing, and stops listening as soon as that window has landed instead
+of waiting out the per-reply timeout. Sixty-four small rounds that each complete beat
+twenty-four large ones that each lose 97%.
+
+Two consequences worth knowing:
+
+- The server re-reads the whole blob per `PULL_REQ`, so a windowed pull costs it one
+  read per round rather than one per card. On a LAN-sized deployment the page cache
+  absorbs this; a larger one would want the read hoisted or cached.
+- `max_rounds` on the client now bounds **rounds that achieve nothing**, not rounds. A
+  window that lands is progress no matter how much is left, so the round budget no
+  longer has to be larger than the card.
+
 ---
 
 # Hardening (M5)
