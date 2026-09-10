@@ -5,4 +5,12 @@
   <version>0.1.0</version>
   <short_description>Sync GameCube saves, then launch Nintendont</short_description>
   <long_description>Syncs the memory cards in /saves with a SlotSync server over the local network, then chainloads Nintendont. Configure it in sd:/slotsync/slotsync.cfg.</long_description>
+  <!-- Both of these are copied from Nintendont's own meta.xml, and they have to
+       be, because whatever privileges the Homebrew Channel grants this app are
+       what Nintendont inherits when we chainload it. Without ahb_access it
+       cannot reach the hardware it needs to load IOS58 out of NAND, and fails
+       with IOS_Open on /shared1 -- which is exactly what a launcher forgetting
+       to ask for what it launches looks like. -->
+  <no_ios_reload/>
+  <ahb_access/>
 </app>
