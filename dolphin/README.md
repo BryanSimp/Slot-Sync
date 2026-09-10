@@ -22,6 +22,19 @@ So this daemon makes the PC speak the console's unit instead: one card per game,
 with `MemcardAPath` in `Dolphin.ini` repointed before each game runs. Sync stays
 byte-exact raw-to-raw, and nothing ever edits the inside of a card.
 
+### Cards carry a region in their name
+
+`GXXE01.USA.raw`, not `GXXE01.raw`. Dolphin does not use `MemcardAPath`
+literally -- it treats it as a base and inserts the running game's region before
+the extension. A card named without one is never opened: Dolphin creates its own
+blank 128 Mbit card under the name it wanted, plays against that, and the synced
+card sits beside it collecting nothing while every save goes somewhere the sync
+never looks.
+
+Its own default, `MemoryCardA.USA.raw`, is the tell -- a name that already
+carries a region is used as-is. The region comes from the fourth character of
+the game id, which is the country code.
+
 ## Setup
 
 ```bash

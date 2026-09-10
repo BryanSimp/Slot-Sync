@@ -42,6 +42,29 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+#: Dolphin's own directory names for the three regions it separates cards by.
+REGIONS = ("USA", "EUR", "JAP")
+
+#: Fourth character of a GameCube game id is its country code. Dolphin maps it
+#: to a region, and to the directory name above. Anything not listed here is one
+#: of the PAL country codes (D German, F French, I Italian, S Spanish, and the
+#: rest), so EUR is the right default rather than a guess.
+_COUNTRY_REGION = {"E": "USA", "N": "USA", "J": "JAP", "W": "JAP", "K": "JAP"}
+
+
+def region_for(game_id: str) -> str:
+    """The region Dolphin will look for this game's card under."""
+    game_id = game_id.upper()
+    if len(game_id) < 4:
+        return "USA"
+    return _COUNTRY_REGION.get(game_id[3], "EUR")
+
+
+def is_game_id(text: str) -> bool:
+    """Six characters, letters and digits: what the server keys a card by."""
+    return len(text) == 6 and text.isalnum() and text.isascii()
+
+
 class CardDirectory:
     """A directory of per-game `.raw` cards plus its sidecar state."""
 
@@ -56,14 +79,21 @@ class CardDirectory:
     def path_for(self, game_id: str, slot: str = "A") -> Path:
         """Where a game's card lives.
 
-        Slot A uses the bare `GAMEID.raw` that Nintendont writes, so a file can
-        be moved between an SD card and here without renaming. Slot B, which is
-        rare, gets a suffix.
+        The region suffix is not decoration -- it is what makes Dolphin open
+        this file instead of making its own. Dolphin treats `MemcardAPath` as a
+        base and inserts the running game's region before the extension, so a
+        slot pointed at `GXXE01.raw` reads and writes `GXXE01.USA.raw`. Left to
+        it, it creates that as a blank 128 Mbit card and plays against it while
+        the synced card sits beside it untouched.
+
+        A name that already carries a region is used as-is, which is how
+        Dolphin's own default `MemoryCardA.USA.raw` survives. So carry it.
         """
         game_id = game_id.upper()
+        region = region_for(game_id)
         if slot.upper() == "B":
-            return self.root / f"{game_id}-B.raw"
-        return self.root / f"{game_id}.raw"
+            return self.root / f"{game_id}-B.{region}.raw"
+        return self.root / f"{game_id}.{region}.raw"
 
     def exists(self, game_id: str, slot: str = "A") -> bool:
         return self.path_for(game_id, slot).is_file()
@@ -99,14 +129,33 @@ class CardDirectory:
         return sha256_hex(path.read_bytes())
 
     def known_games(self) -> list[tuple[str, str]]:
-        """(game_id, slot) for every card on disk."""
+        """(game_id, slot) for every card on disk.
+
+        Anything whose name is not a game id is skipped rather than guessed at.
+        It used to be guessed at, and a stray `GXXE01.USA.raw` alongside
+        `GXXE01.raw` meant the watcher spent every poll trying to push a game
+        called "GXXE01.USA" and logging the failure.
+        """
         found = []
         for path in sorted(self.root.glob("*.raw")):
             stem = path.stem
+            for suffix in REGIONS:
+                if stem.upper().endswith(f".{suffix}"):
+                    stem = stem[: -(len(suffix) + 1)]
+                    break
+
+            slot = "A"
             if stem.endswith("-B"):
-                found.append((stem[:-2].upper(), "B"))
-            else:
-                found.append((stem.upper(), "A"))
+                stem, slot = stem[:-2], "B"
+
+            if not is_game_id(stem):
+                log.debug("ignoring a file that is not a card", extra={"path": str(path)})
+                continue
+            # A card left over under the old region-less name sits beside the
+            # one Dolphin uses. Same card, named twice; report it once.
+            entry = (stem.upper(), slot)
+            if entry not in found:
+                found.append(entry)
         return found
 
     # --- state ------------------------------------------------------------

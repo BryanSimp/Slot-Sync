@@ -16,7 +16,10 @@ setlocal
 cd /d "%~dp0"
 set PYTHONPATH=src
 
-python -m slotsync_dolphin watch
+REM The log file is the point: a console window that closes takes the only
+REM record of what happened with it, which is how the first run of this ended
+REM up unexplained.
+python -m slotsync_dolphin --log-file "%USERPROFILE%\.slotsync\watch.log" watch
 set RC=%ERRORLEVEL%
 
 REM Ctrl-C leaves 2 or 130 depending on the shell; neither is a failure worth

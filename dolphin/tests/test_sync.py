@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from slotsync_dolphin.cards import CardDirectory, sha256_hex
+from slotsync_dolphin.cards import CardDirectory, region_for, sha256_hex
 from slotsync_dolphin.client import Conflict
 from slotsync_dolphin.dolphin import (
     EXI_MEMORY_CARD,
@@ -225,7 +225,7 @@ def test_slot_b_uses_its_own_keys_and_filename(syncer, config):
     syncer.point_dolphin_at(game, "B")
 
     dolphin = DolphinConfig(DolphinPaths(user_dir=config.user_dir))
-    assert dolphin.memcard_path(1).name == f"{game}-B.raw"
+    assert dolphin.memcard_path(1).name == f"{game}-B.{region_for(game)}.raw"
     assert dolphin.slot_device(1) == EXI_MEMORY_CARD
 
 
@@ -302,12 +302,35 @@ def test_watch_survives_a_conflict_without_overwriting(syncer):
 # --- card directory -------------------------------------------------------
 
 
-def test_cards_are_named_the_way_nintendont_names_them(tmp_path):
-    """So a file can move between an SD card and here without renaming."""
+def test_cards_are_named_the_way_dolphin_resolves_them(tmp_path):
+    """Dolphin treats MemcardAPath as a base and inserts the running game's
+    region before the extension. A card named without one is never opened:
+    Dolphin makes its own blank card under the name it wanted and plays against
+    that, while the synced card sits beside it collecting nothing.
+
+    The region comes from the fourth character of the game id, which is the
+    country code.
+    """
     cards = CardDirectory(tmp_path)
-    assert cards.path_for("GALE01", "A").name == "GALE01.raw"
-    assert cards.path_for("gale01", "A").name == "GALE01.raw"
-    assert cards.path_for("GALE01", "B").name == "GALE01-B.raw"
+    assert cards.path_for("GALE01", "A").name == "GALE01.USA.raw"
+    assert cards.path_for("gale01", "A").name == "GALE01.USA.raw"
+    assert cards.path_for("GALE01", "B").name == "GALE01-B.USA.raw"
+
+    assert cards.path_for("GALP01", "A").name == "GALP01.EUR.raw"  # P: PAL
+    assert cards.path_for("GALD01", "A").name == "GALD01.EUR.raw"  # D: German
+    assert cards.path_for("GALJ01", "A").name == "GALJ01.JAP.raw"  # J: Japan
+
+
+def test_a_stray_file_is_not_mistaken_for_a_game(tmp_path):
+    """Every `.raw` used to be taken as a card named after its stem. A leftover
+    `GXXE01.USA.raw` beside `GXXE01.raw` therefore became a game called
+    "GXXE01.USA", and the watcher spent every poll failing to push it."""
+    cards = CardDirectory(tmp_path)
+    cards.write("GALE01", "A", b"\x00" * 64)
+    (tmp_path / "notes.raw").write_bytes(b"")
+    (tmp_path / "GALE01.raw").write_bytes(b"")
+
+    assert cards.known_games() == [("GALE01", "A")]
 
 
 def test_known_games_reads_both_slots_back(tmp_path):
