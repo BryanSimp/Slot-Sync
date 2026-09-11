@@ -99,6 +99,15 @@ static void ss_log_flush(void)
 /* A 16 MiB card is 16384 chunks, one bit each. */
 #define SS_BITMAP_BYTES 2048
 
+/* Per-block fingerprints for the delta push -- SlotSyncLogic.h.
+ *
+ * One u32 per 8 KiB block, so 2048 entries is 8 KiB of BSS and covers a 16 MiB
+ * card. With both slots enabled each gets half, which caps a delta-capable card
+ * at 8 MiB per slot; a card over its share scans as -1 and is pushed whole,
+ * which is what every push did before this existed. Raise the number if that
+ * ever bites, and pay the BSS. */
+#define SS_FP_ENTRIES 2048
+
 #ifdef GCNCARD_ENABLE_SLOT_B
 #define SS_SLOTS 2
 #else
@@ -115,6 +124,16 @@ typedef struct {
 	int halted;      /* a conflict: stop touching this card entirely */
 	int pushed_any;  /* whether `parent` came from us rather than the wrapper */
 	int lineage;     /* we know what version our bytes descend from */
+	/* The fingerprint table describes exactly the bytes the server committed
+	 * as `parent`. Only then can a delta be built against it.
+	 *
+	 * Cleared before every push and set again only when that push is
+	 * confirmed. ssl_delta_scan updates the table in place, so between the
+	 * scan and the ack the table describes bytes the server has not accepted
+	 * -- and a delta built on those would name the wrong chunks. The cost of
+	 * a failed push is therefore one whole-card push afterwards, which is
+	 * what the failure would have cost anyway. */
+	int fp_valid;
 } ss_slot;
 
 static ssl_config cfg;
@@ -122,6 +141,10 @@ static ss_slot slots[SS_SLOTS];
 static ssnet net;
 static ss_client client;
 static u8 bitmap[SS_BITMAP_BYTES] ALIGNED(32);
+/* What changed since the last confirmed push. Separate from `bitmap`, which
+ * ss_push_delta uses as its own scratch and rewrites every round. */
+static u8 dirtyMap[SS_BITMAP_BYTES] ALIGNED(32);
+static u32 fingerprints[SS_FP_ENTRIES];
 static char fileBuf[SS_CFG_MAX] ALIGNED(32);
 
 /* Whether ss_connect has succeeded. File scope because SlotSync_Init makes the
@@ -318,6 +341,7 @@ static void ss_push_slot(int slot)
 	/* uint32_t, not u32: the two are both 32 bits wide but need not be the
 	 * same type, and this one is passed to the core by pointer. */
 	uint32_t assigned = 0;
+	int useDelta = 0;
 	int rc;
 
 	if (image == NULL || size == 0) {
@@ -335,8 +359,37 @@ static void ss_push_slot(int slot)
 	s->dirty = 0;
 	sync_before_read((void *)image, (int)size);
 
-	sslog("SlotSync: pushing %s slot %c, %u KiB, parent v%u\r\n", s->game_id,
-	      slot + 'A', size / 1024, s->parent);
+	/* What changed since the last confirmed push.
+	 *
+	 * The scan always runs, because it is what keeps the fingerprint table
+	 * current; whether its answer is usable is a separate question, and
+	 * fp_valid is what answers it. The table is invalid before the first
+	 * push of a session and after any push that did not land, so the first
+	 * push of a card always goes whole. */
+	{
+		u32 share = SS_FP_ENTRIES / SS_SLOTS;
+		int32_t marked = ssl_delta_scan(image, size,
+						fingerprints + (u32)slot * share,
+						share, dirtyMap, (u32)sizeof(dirtyMap));
+
+		useDelta = s->fp_valid && marked >= 0
+			   && ssl_delta_worthwhile((u32)marked, ss_chunk_count(size));
+
+		/* Not valid again until this push is confirmed: the scan above
+		 * has already moved the table on to bytes the server has not
+		 * accepted. */
+		s->fp_valid = 0;
+
+		if (useDelta) {
+			sslog("SlotSync: pushing %s slot %c, %u of %u chunks "
+			      "changed, parent v%u\r\n", s->game_id, slot + 'A',
+			      (u32)marked, ss_chunk_count(size), s->parent);
+		} else {
+			sslog("SlotSync: pushing %s slot %c, %u KiB whole, "
+			      "parent v%u\r\n", s->game_id, slot + 'A',
+			      size / 1024, s->parent);
+		}
+	}
 
 	/* Fresh trace budget, so that if the per-datagram trace is ever turned
 	 * back on it spends itself on the push rather than on the handshake
@@ -377,8 +430,13 @@ static void ss_push_slot(int slot)
 	netConnected = 1;
 
 	workerBusy = 1;
-	rc = ss_push(&client, s->game_id, (u8)slot, image, size, s->parent,
-		     s->parent + 1, bitmap, sizeof(bitmap), &assigned);
+	/* ss_push_delta with a NULL bitmap is exactly ss_push, so there is one
+	 * call rather than two paths that can drift apart. If the server cannot
+	 * seed from our parent it answers 0x0c and the client sends the whole
+	 * card itself; nothing here has to handle that. */
+	rc = ss_push_delta(&client, s->game_id, (u8)slot, image, size, s->parent,
+			   s->parent + 1, useDelta ? dirtyMap : NULL, bitmap,
+			   sizeof(bitmap), &assigned);
 	workerBusy = 0;
 
 	/* A lost commit ACK is not a failed push.
@@ -409,6 +467,9 @@ static void ss_push_slot(int slot)
 		s->parent = (u32)assigned;
 		s->pushed_any = 1;
 		s->pushed_at = read32(HW_TIMER);
+		/* Confirmed, so the table now describes what the server holds
+		 * and the next push can be a delta against it. */
+		s->fp_valid = 1;
 		sslog("SlotSync: %s is now v%u (%u sends refused)\r\n",
 		      s->game_id, (u32)assigned, net.dropped);
 		/* Do NOT write the handoff here.

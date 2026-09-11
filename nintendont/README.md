@@ -73,7 +73,8 @@ driver that is already there, and pick the right moment to use it".
 3. `GCNCard_Save()` calls `SlotSync_NotifyCardSaved(slot)` once the card has reached the SD
    card. That records a timestamp and returns; it never blocks the main loop.
 4. When a card has been **quiet for 4 s** and the last push was **at least 30 s ago**, the
-   worker pushes the whole card. Both numbers are configurable.
+   worker pushes. The first push of a session sends the whole card; after that it sends
+   only the blocks that changed — see "Delta push" below. Both numbers are configurable.
 5. On exit, `SlotSync_Shutdown()` gives an in-flight transfer up to 3 s to land, then
    writes `/slotsync/runtime.txt` so the launcher knows where the lineage got to.
 
@@ -180,8 +181,11 @@ None of those failed loudly. Most looked exactly like "the server is unreachable
   was gated on the worker being idle, and the transfer rate came down 4×. Several sessions
   since have pushed saves mid-game without recurrence — which is evidence, not proof.
 - **Cards larger than 2 MiB in flight.** A 16 MiB card is 16384 chunks, which is exactly
-  the chunk bitmap's limit, with no headroom.
-- **Delta push.** Still a whole card every time; see the last section.
+  the chunk bitmap's limit, with no headroom. Delta push makes this much less pressing —
+  a save is a few dozen chunks whatever the card's size — but the whole-card fallback
+  still has to fit, and nobody has run one.
+- **Delta push on hardware.** It works over real sockets in `tests/` and the card pulls
+  back byte-identical, but no console has sent one.
 
 ## Testing it
 
@@ -206,16 +210,53 @@ The first thing to check is `SlotSync: server reachable, runtime sync armed`, wh
 the hard part works. Then save in-game and watch for a new version in the web UI without
 quitting.
 
-## Known limitation: every push is a whole card
+## Delta push: only the chunks that changed
 
-The protocol is byte-range addressed and `PLAN.md` §2 anticipates delta sync — but the
-server currently starts every staging buffer as `bytearray(total_size)`, all zeros
-(`server/src/slotsync/udp.py`, `_on_push_begin`). A partial push would therefore commit a
-card that is mostly zeros, so this client sends all of it, every time.
+Every push used to send the whole card. At the paced 400 datagrams/sec this client sends
+at, a 2 MiB card's 2048 chunks is 5.1 s of transfer while a game is running, and a 16 MiB
+card's 16384 is 41 s.
 
-That is why the cooldown defaults to 30 s. Nintendont tracks the dirty byte range in
-`GCNCard_ctx` already, so the console side of a delta push is nearly free; what it needs is
-for the server to seed a staging buffer from the parent version's bytes. That is a protocol
-change and would have to land in the server, `fake_console.py`, `wii/core` and
-`docs/PROTOCOL.md` together, so it is deliberately not done here. For a 2 MiB card it would
-turn 1.6 s of radio time into well under a tenth of that.
+A save write touches its own data blocks plus one directory block and one BAT block, so
+the bytes that actually changed are a few percent of the card:
+
+| Save | Blocks | Chunks sent | of a 2 MiB card | of a 16 MiB card |
+|---|---|---|---|---|
+| Wind Waker | 3 | 40 | 2.0% | 0.2% |
+| Melee | 11 | 104 | 5.1% | 0.6% |
+| Animal Crossing | 57 | 472 | 23% | 2.9% |
+
+`PUSH_BEGIN` now carries a flag asking the server to seed its staging buffer from the
+parent version instead of from zeros, `PUSH_DELTA` declares which chunks are coming, and
+`PUSH_END` still carries the digest of the **whole** card — see `docs/PROTOCOL.md` for the
+wire format and `PLAN.md` §5 for why that digest is what lets a byte-level splice coexist
+with "never merge two cards".
+
+**The changed set comes from fingerprints, not from Nintendont's dirty range.** The kernel
+keeps one 32-bit fingerprint per 8 KiB block — `ssl_delta_scan` in `SlotSyncLogic.c`, so it
+is testable off a console — and compares on each push. Nintendont's `GCNCard_ctx` does
+track a dirty range of its own, but it is a *range*: a game touching the directory at the
+front and a save block in the middle dirties everything between. Reading it would also need
+another hook into a file this project only patches 61 lines of. The scan is one pass over a
+card that is already being hashed for `PUSH_END` anyway.
+
+Block granularity rather than chunk is not a compromise: a GameCube card is erased and
+written in 8 KiB blocks, so a game cannot change less than one. One dirty block is eight
+dirty chunks.
+
+Two things to know if you touch this:
+
+- **The table is only usable while it describes what the server committed.**
+  `ssl_delta_scan` updates it in place, so between the scan and the ack it describes bytes
+  the server has not accepted. `fp_valid` is cleared before every push and set again only
+  when that push is confirmed — so the first push of a session, and the one after any
+  failure, goes whole. Getting this wrong is the one way a delta names the wrong chunks.
+- **A server that cannot seed answers `NACK 0x0c`,** and `ss_push_delta` retries as a
+  whole-card push by itself. Nothing in `SlotSync.c` handles it. Without that fallback a
+  pruned parent blob would make a card unpushable.
+
+The table costs 8 KiB of BSS (`SS_FP_ENTRIES`), split between the slots, which caps a
+delta-capable card at 16 MiB with one slot enabled and 8 MiB each with two. A card over its
+share scans as `-1` and is pushed whole.
+
+The 30 s cooldown is now conservative rather than necessary — it was sized for a 5 s
+transfer. Lowering `runtime_cooldown_ms` is the obvious next thing to try on hardware.
