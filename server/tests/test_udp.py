@@ -642,9 +642,7 @@ def test_push_delta_on_a_whole_card_transfer_is_refused(server):
 
     run(
         server._dispatch(
-            Message(
-                MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=5, payload=b"\x01"
-            ),
+            Message(MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=5, payload=b"\x01"),
             PEER,
         )
     )
@@ -655,9 +653,7 @@ def test_push_delta_on_a_whole_card_transfer_is_refused(server):
 def test_push_delta_without_a_staging_buffer_is_nacked(server):
     run(
         server._dispatch(
-            Message(
-                MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=7, payload=b"\x01"
-            ),
+            Message(MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=7, payload=b"\x01"),
             PEER,
         )
     )
