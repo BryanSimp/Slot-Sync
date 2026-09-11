@@ -42,8 +42,15 @@ enum {
     SS_ACK = 0x06,
     SS_NACK = 0x07,
     SS_PULL_CHUNK = 0x08,
-    SS_HEARTBEAT = 0x09
+    SS_HEARTBEAT = 0x09,
+    SS_PUSH_DELTA = 0x0A
 };
+
+/* Header flags. Bit 0 on a PUSH_BEGIN asks the server to seed its staging
+ * buffer from `parent_version` rather than from zeros, so only the chunks that
+ * changed have to be sent. Every other message sends flags = 0.
+ * docs/PROTOCOL.md, "Delta push". */
+#define SS_FLAG_DELTA 0x0001
 
 /* NACK error codes, as they appear on the wire. Prefixed SS_NACK_ to keep them
  * distinct from the SS_ERR_ result codes in client.h -- the two sets overlap
@@ -59,7 +66,8 @@ enum {
     SS_NACK_VALIDATION = 0x08,
     SS_NACK_TOO_LARGE = 0x09,
     SS_NACK_RATE_LIMITED = 0x0A,
-    SS_NACK_STAGING_EXPIRED = 0x0B
+    SS_NACK_STAGING_EXPIRED = 0x0B,
+    SS_NACK_DELTA_UNAVAILABLE = 0x0C
 };
 
 /* The header, unpacked. Field names match docs/PROTOCOL.md. */

@@ -20,6 +20,10 @@ typedef struct {
     unsigned pace_us;
     unsigned sent_since_pause;
 
+    /* Every datagram the client handed us, dropped ones included. A delta
+     * push is only working if this stays far below the card's chunk count. */
+    unsigned sent;
+
     /* Injected link damage, for the loss/reordering tests. */
     int loss_percent;
     unsigned int rng;

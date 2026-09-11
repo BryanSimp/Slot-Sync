@@ -17,6 +17,7 @@ import pytest
 
 import fake_console
 from slotsync.protocol import (
+    FLAG_DELTA,
     MAX_PAYLOAD,
     Error,
     Message,
@@ -376,6 +377,353 @@ def test_restarting_a_transfer_discards_the_old_bytes(server):
     assert not any(staging.data)
 
 
+# --- delta push -----------------------------------------------------------
+#
+# docs/PROTOCOL.md, "Delta push". PUSH_BEGIN with flags bit 0 seeds the staging
+# buffer from the parent version instead of zeros, PUSH_DELTA declares which
+# chunks are coming, and PUSH_END still carries the digest of the client's whole
+# card -- which is the thing that keeps the seeding honest.
+
+
+def differing_chunks(new: bytes, old: bytes) -> list[int]:
+    return [
+        i
+        for i in range(chunk_count(len(new)))
+        if new[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD]
+        != old[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD]
+    ]
+
+
+def delta_messages(image, parent, indices, *, game="GALE01", slot=0, device=1, tid=2):
+    """The datagrams a delta push sends: begin, one manifest, the chunks, end."""
+    total = len(image)
+    common = {
+        "device_id": device,
+        "game_id": game,
+        "slot": slot,
+        "card_version": tid,
+    }
+    begin = Message(
+        msg_type=MsgType.PUSH_BEGIN,
+        total_size=total,
+        parent_version=parent,
+        flags=FLAG_DELTA,
+        **common,
+    )
+    bitmap = bytearray((max(indices) // 8) + 1) if indices else bytearray()
+    for index in indices:
+        bitmap[index >> 3] |= 1 << (index & 7)
+    manifest = Message(
+        msg_type=MsgType.PUSH_DELTA,
+        sequence=0,
+        total_size=total,
+        payload=bytes(bitmap),
+        **common,
+    )
+    chunks = [
+        Message(
+            msg_type=MsgType.PUSH_CHUNK,
+            offset=i * MAX_PAYLOAD,
+            sequence=i,
+            total_size=total,
+            payload=image[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD],
+            **common,
+        )
+        for i in indices
+    ]
+    end = Message(
+        msg_type=MsgType.PUSH_END,
+        total_size=total,
+        payload=hashlib.sha256(image).digest(),
+        **common,
+    )
+    return begin, manifest, chunks, end
+
+
+async def do_delta_push(server, image, parent, indices, **kwargs):
+    begin, manifest, chunks, end = delta_messages(image, parent, indices, **kwargs)
+    await server._dispatch(begin, PEER)
+    await server._dispatch(manifest, PEER)
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    await server._dispatch(end, PEER)
+    return drain(server)
+
+
+def _seed_head(server, image=CARD):
+    """Commit `image` so a delta has something to descend from."""
+    run(do_push(server, image))
+    drain(server)
+    return server.store.head("GALE01", 0).version
+
+
+def test_a_delta_push_commits_without_sending_the_whole_card(server):
+    head = _seed_head(server)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    assert 0 < len(indices) < chunk_count(len(changed)), "the fixture is not a delta"
+
+    replies = run(do_delta_push(server, changed, head, indices))
+
+    assert [r.msg_type for r in replies] == [MsgType.ACK]
+    assert server.store.read_image(server.store.head("GALE01", 0)) == changed
+
+
+def test_a_delta_sends_far_fewer_chunks_than_the_card_has(server):
+    """The whole point. If this stops holding, the feature has stopped working."""
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    assert len(indices) * 4 < chunk_count(len(changed))
+
+
+def test_the_seeded_bytes_are_the_parents(server):
+    """Chunks the client never sent come back as the parent's, byte for byte."""
+    head = _seed_head(server)
+    changed = bytearray(CARD)
+    changed[MAX_PAYLOAD * 3 : MAX_PAYLOAD * 3 + 4] = b"HACK"
+    changed = bytes(changed)
+
+    run(do_delta_push(server, changed, head, [3]))
+
+    stored = server.store.read_image(server.store.head("GALE01", 0))
+    assert stored == changed
+    assert stored[:MAX_PAYLOAD] == CARD[:MAX_PAYLOAD]
+
+
+def test_a_delta_whose_parent_does_not_match_fails_the_digest(server):
+    """The safety property.
+
+    If the server's parent bytes are not the ones the client thinks it is
+    building on, the assembled image hashes wrong and is refused -- so the
+    byte-level merge is verified rather than assumed. That is what lets
+    CLAUDE.md's "never merge two cards" rule coexist with delta push.
+    """
+    head = _seed_head(server)
+    # The client believes the parent is `other` and sends a delta against it.
+    other = make_card("Something Else Entirely")
+    client_image = bytearray(other)
+    client_image[MAX_PAYLOAD * 3 : MAX_PAYLOAD * 3 + 4] = b"HACK"
+    client_image = bytes(client_image)
+
+    replies = run(do_delta_push(server, client_image, head, [3]))
+
+    assert [r.payload[0] for r in replies] == [Error.CHECKSUM_MISMATCH]
+    assert server.staging == {}
+    assert server.store.read_image(server.store.head("GALE01", 0)) == CARD
+
+
+def test_a_delta_against_an_unknown_parent_is_refused_with_0x0c(server):
+    _seed_head(server)
+    begin, _, _, _ = delta_messages(CARD, 99, [0])
+
+    run(server._dispatch(begin, PEER))
+
+    assert [r.payload[0] for r in drain(server)] == [Error.DELTA_UNAVAILABLE]
+    assert server.staging == {}
+
+
+def test_a_delta_against_v0_is_refused_with_0x0c(server):
+    """v0 is 'the server has never seen this card'. There is nothing to seed."""
+    begin, _, _, _ = delta_messages(CARD, 0, [0])
+
+    run(server._dispatch(begin, PEER))
+
+    assert [r.payload[0] for r in drain(server)] == [Error.DELTA_UNAVAILABLE]
+
+
+def test_a_delta_against_a_pruned_blob_is_refused_with_0x0c(server):
+    head = _seed_head(server)
+    server.store.blobs.delete(server.store.head("GALE01", 0).sha256)
+    begin, _, _, _ = delta_messages(CARD, head, [0])
+
+    run(server._dispatch(begin, PEER))
+
+    assert [r.payload[0] for r in drain(server)] == [Error.DELTA_UNAVAILABLE]
+
+
+def test_a_delta_against_a_differently_sized_parent_is_refused_with_0x0c(server):
+    """A card that changed size has to be pushed whole; a seed would misalign."""
+    head = _seed_head(server)
+    bigger = make_card("Zelda Quest Log", mbit=8)
+    begin, _, _, _ = delta_messages(bigger, head, [0])
+
+    run(server._dispatch(begin, PEER))
+
+    assert [r.payload[0] for r in drain(server)] == [Error.DELTA_UNAVAILABLE]
+
+
+def test_a_gap_nack_names_only_the_declared_chunks(server):
+    """Everything else is the parent's bytes and was never in flight."""
+    head = _seed_head(server)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    begin, manifest, chunks, end = delta_messages(changed, head, indices)
+    run(server._dispatch(begin, PEER))
+    run(server._dispatch(manifest, PEER))
+    for chunk in chunks[1:]:  # drop the first one on the floor
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    run(server._dispatch(end, PEER))
+
+    replies = drain(server)
+    assert [r.payload[0] for r in replies] == [Error.MISSING_CHUNKS]
+    missing = unpack_bitmap(replies[0].payload[1:], replies[0].sequence)
+    assert missing == [indices[0]]
+
+
+def test_a_delta_recovers_from_a_lost_chunk(server):
+    head = _seed_head(server)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    begin, manifest, chunks, end = delta_messages(changed, head, indices)
+    run(server._dispatch(begin, PEER))
+    run(server._dispatch(manifest, PEER))
+    for chunk in chunks[1:]:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    run(server._dispatch(end, PEER))
+    drain(server)
+
+    server.datagram_received(pack(chunks[0], TEST_PSK), PEER)
+    run(server._dispatch(end, PEER))
+
+    assert [r.msg_type for r in drain(server)] == [MsgType.ACK]
+    assert server.store.read_image(server.store.head("GALE01", 0)) == changed
+
+
+def test_declaring_a_chunk_twice_is_harmless(server):
+    """Why PUSH_DELTA needs no replay protection: the bit is already set."""
+    head = _seed_head(server)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    begin, manifest, chunks, end = delta_messages(changed, head, indices)
+    run(server._dispatch(begin, PEER))
+    run(server._dispatch(manifest, PEER))
+    run(server._dispatch(manifest, PEER))
+    assert next(iter(server.staging.values())).outstanding == len(indices)
+
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    run(server._dispatch(end, PEER))
+
+    assert [r.msg_type for r in drain(server)] == [MsgType.ACK]
+
+
+def test_a_declaration_arriving_after_its_chunk_still_completes(server):
+    """UDP reorders. Neither order may leave the transfer stuck."""
+    head = _seed_head(server)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    indices = differing_chunks(changed, CARD)
+
+    begin, manifest, chunks, end = delta_messages(changed, head, indices)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    run(server._dispatch(manifest, PEER))
+    drain(server)
+    run(server._dispatch(end, PEER))
+
+    assert [r.msg_type for r in drain(server)] == [MsgType.ACK]
+    assert server.store.read_image(server.store.head("GALE01", 0)) == changed
+
+
+def test_push_delta_on_a_whole_card_transfer_is_refused(server):
+    """Without the seed, everything outside the declaration would be zeros."""
+    _seed_head(server)
+    begin, _, _ = push_messages(CARD, tid=5)
+    run(server._dispatch(begin, PEER))
+    drain(server)
+
+    run(
+        server._dispatch(
+            Message(
+                MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=5, payload=b"\x01"
+            ),
+            PEER,
+        )
+    )
+
+    assert [r.payload[0] for r in drain(server)] == [Error.MALFORMED_HEADER]
+
+
+def test_push_delta_without_a_staging_buffer_is_nacked(server):
+    run(
+        server._dispatch(
+            Message(
+                MsgType.PUSH_DELTA, 1, "GALE01", 0, card_version=7, payload=b"\x01"
+            ),
+            PEER,
+        )
+    )
+
+    assert [r.payload[0] for r in drain(server)] == [Error.STAGING_EXPIRED]
+
+
+def test_declaring_a_chunk_past_the_end_is_refused(server):
+    head = _seed_head(server)
+    begin, _, _, _ = delta_messages(CARD, head, [0])
+    run(server._dispatch(begin, PEER))
+    drain(server)
+
+    beyond = chunk_count(len(CARD))
+    bitmap = bytearray((beyond // 8) + 1)
+    bitmap[beyond >> 3] |= 1 << (beyond & 7)
+    run(
+        server._dispatch(
+            Message(
+                MsgType.PUSH_DELTA,
+                1,
+                "GALE01",
+                0,
+                card_version=2,
+                total_size=len(CARD),
+                payload=bytes(bitmap),
+            ),
+            PEER,
+        )
+    )
+
+    assert [r.payload[0] for r in drain(server)] == [Error.MALFORMED_HEADER]
+
+
+def test_restarting_a_delta_discards_the_declaration_too(server):
+    """A repeat of PUSH_BEGIN is a retry, and half a declaration is worse than
+    none: it would leave the server believing chunks were already accounted
+    for."""
+    head = _seed_head(server)
+    begin, manifest, _, _ = delta_messages(CARD, head, [0, 1, 2])
+    run(server._dispatch(begin, PEER))
+    run(server._dispatch(manifest, PEER))
+    assert next(iter(server.staging.values())).outstanding == 3
+
+    run(server._dispatch(begin, PEER))
+
+    staging = next(iter(server.staging.values()))
+    assert staging.outstanding == 0
+    assert not any(staging.declared)
+    assert staging.received_count == 0
+    assert bytes(staging.data) == CARD  # seeded afresh, not zeroed
+
+
+def test_a_delta_against_a_stale_parent_is_still_a_conflict(server):
+    """Seeding changes nothing about who decides a conflict -- PLAN.md 7."""
+    head = _seed_head(server)
+    run(do_push(server, make_card("Someone Else Was Here"), parent=head, tid=3))
+    drain(server)
+
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    replies = run(do_delta_push(server, changed, head, differing_chunks(changed, CARD)))
+
+    assert [r.payload[0] for r in replies] == [Error.CONFLICT]
+    assert replies[0].card_version == head + 1
+
+
 # --- expiry ---------------------------------------------------------------
 
 
@@ -583,3 +931,68 @@ def test_losing_the_transport_is_logged_loudly(server, caplog):
     with caplog.at_level("ERROR", logger="slotsync.udp"):
         server.connection_lost(OSError("gone"))
     assert any("lost its transport" in r.message for r in caplog.records)
+
+
+def test_fake_console_delta_pushes_only_what_changed(udp_config, tmp_path):
+    """The third implementation of the wire format, over real sockets.
+
+    CLAUDE.md keeps `fake_console.py` independent of the server's own protocol
+    module precisely so a test like this can catch a delta encoding that only
+    the server and its own parser agree on.
+    """
+    first = tmp_path / "v1.raw"
+    first.write_bytes(CARD)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    second = tmp_path / "v2.raw"
+    second.write_bytes(changed)
+    out = tmp_path / "out.raw"
+
+    sent: list[int] = []
+
+    def work(port):
+        link = fake_console.Link("127.0.0.1", port, TEST_PSK, timeout=1.0)
+        try:
+            fake_console.do_push(link, 1, "GALE01", 0, first, 0, 1, 8, 0.0)
+            before = link.sent
+            fake_console.do_push(
+                link, 1, "GALE01", 0, second, 1, 2, 8, 0.0, delta_from=first
+            )
+            sent.append(link.sent - before)
+            fake_console.do_pull(link, 1, "GALE01", 0, out, 0, 8)
+        finally:
+            link.close()
+
+    _, store = _run_real(udp_config, work)
+
+    assert out.read_bytes() == changed
+    assert store.head("GALE01", 0).version == 2
+    # begin + manifest + end is three datagrams of overhead, and the whole card
+    # is 512 chunks. Anything near that means the delta did not happen.
+    assert sent[0] < chunk_count(len(changed)) // 4
+
+
+def test_fake_console_falls_back_when_the_server_cannot_seed(udp_config, tmp_path):
+    """A pruned parent blob must not make a card unpushable."""
+    first = tmp_path / "v1.raw"
+    first.write_bytes(CARD)
+    changed = make_card("Zelda Quest Log", "Mario Sunshine Save")
+    second = tmp_path / "v2.raw"
+    second.write_bytes(changed)
+
+    def work(port):
+        link = fake_console.Link("127.0.0.1", port, TEST_PSK, timeout=1.0)
+        try:
+            fake_console.do_push(link, 1, "GALE01", 0, first, 0, 1, 8, 0.0)
+            # Prune the parent out from under the delta.
+            store = Store(udp_config)
+            store.blobs.delete(store.head("GALE01", 0).sha256)
+            fake_console.do_push(
+                link, 1, "GALE01", 0, second, 1, 2, 8, 0.0, delta_from=first
+            )
+        finally:
+            link.close()
+
+    _, store = _run_real(udp_config, work)
+
+    assert store.head("GALE01", 0).version == 2
+    assert store.read_image(store.head("GALE01", 0)) == changed

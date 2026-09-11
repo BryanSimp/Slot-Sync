@@ -247,6 +247,16 @@ command does the pull, the launch and the push.
   atomic unit for conflict resolution, even though *transport* is chunked.
 - **Sync at the `.raw` level, never via `.gci`.** GCI extraction round-trips can trip
   copy-protection flags on some games' saves. Raw-to-raw is byte-exact.
+- **Delta push is not an exception to the first rule, and here is why.** A delta push
+  (M11, `docs/PROTOCOL.md`) has the server seed a staging buffer from the parent version
+  and the client overwrite only the chunks that changed — which is byte-level splicing of
+  two images, exactly the shape the rule forbids. What makes it legal is that
+  `PUSH_END` still carries the SHA-256 of the client's **whole** card. The client is
+  committing to one specific complete image; the wire is simply not carrying the parts
+  the server already has. If the server's copy of the parent differs from the client's in
+  any byte, the assembled image hashes wrong and the push is refused with `0x07`. The
+  splice is verified, never assumed, and no card is ever reconciled from two sources —
+  which is what the rule is actually protecting.
 - A directory entry gives you the game code, maker code, internal filename, comment
   offset, and block count. That is what the web UI should display — real save names,
   not just filenames.
@@ -521,6 +531,35 @@ somewhere. **Done** — it is in the README, and the run behind it was: the daem
 formatting a blank card, the PC pushing a save over HTTP as v2, the console pulling those
 exact bytes over UDP, the console pushing v3, and the PC pulling that back byte-identical.
 Both transports, one lineage, `parent` chaining correctly through all three.
+
+**M11 — Delta push**
+Send only the chunks that changed. `PUSH_BEGIN` gains a flag asking the server to seed
+its staging buffer from `parent_version` instead of from zeros, `PUSH_DELTA` (0x0A)
+declares which chunks are coming, and `PUSH_END` still carries the digest of the whole
+card — see §5's rule above for why that is what keeps it safe, and `docs/PROTOCOL.md` for
+the wire format.
+
+This exists for the kernel client. A whole 2 MiB card is 2048 datagrams at the paced 400
+per second the console sends at, which is 5.1 s of transfer while a game runs; a 16 MiB
+card is 41 s. A save write touches its own blocks plus one directory and one BAT block,
+so the bytes that changed are 2–5% of the card. **The point is not the multiplier but
+that push cost stops scaling with the card and starts scaling with the save.**
+
+The console finds the changed set from a table of per-block fingerprints, not from
+Nintendont's own dirty range: that range is a span rather than a set, so one touch at
+each end of the card dirties everything between, and reading it would need another hook
+into a file this project only patches 61 lines of. Four bytes per 8 KiB block, updated in
+one pass over a card that is already being hashed for `PUSH_END` anyway.
+
+*Done when:* a delta lands over real sockets and the card pulls back byte-identical, and
+a server that cannot seed from the named parent is handled by the client rather than by
+the caller. **Done** — 11 datagrams for a 2048-chunk card in the host tests, and a
+pruned parent blob falls back to a whole-card push without the caller seeing it.
+
+**Delta pull is deliberately not part of this.** The kernel client never pulls a card, so
+it would only help the libogc launcher. `docs/PROTOCOL.md` records where it would go: no
+new message type is needed, because `PULL_REQ` already carries a bitmap of wanted chunks
+and its `parent_version` field is unused.
 
 ### Open question that gates M7
 

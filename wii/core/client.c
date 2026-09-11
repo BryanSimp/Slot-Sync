@@ -189,9 +189,106 @@ static int send_chunks(ss_client *c, const char *game_id, uint8_t slot,
     return SS_OK;
 }
 
-int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *image,
-            uint32_t size, uint32_t parent, uint32_t transfer_id, uint8_t *bitmap,
-            size_t bitmap_cap, uint32_t *out_version)
+/* One PUSH_DELTA window: the chunks this transfer will send, from `base`.
+ *
+ * The payload is the caller's own bitmap, sliced -- no copy and no second
+ * buffer. That works because a window is 8192 chunks, so its base is always a
+ * whole number of bytes into the bitmap, and because the wire's bit order is
+ * the one the bitmap already uses. It is the reason docs/PROTOCOL.md picked
+ * LSB-first.
+ *
+ * Acked, unlike a chunk. A lost declaration would otherwise leave the server
+ * believing the delta was empty, and that only surfaces at PUSH_END as a digest
+ * failure -- a whole-card restart bought with one dropped datagram.
+ */
+static int declare_window(ss_client *c, const char *game_id, uint8_t slot,
+                          uint32_t transfer_id, uint32_t size, const uint8_t *dirty,
+                          uint32_t base, size_t len)
+{
+    ss_datagram buffer;
+    ss_header h;
+    ss_header in;
+    const uint8_t *payload;
+    size_t payload_len;
+    int rc;
+
+    /* Trailing zero bytes declare nothing; a window that is all zeros need not
+     * be sent at all. */
+    while (len > 0 && dirty[(base >> 3) + len - 1] == 0) {
+        len--;
+    }
+    if (len == 0) {
+        return SS_OK;
+    }
+
+    ss_header_init(&h, SS_PUSH_DELTA, c->device_id, game_id, slot);
+    h.card_version = transfer_id;
+    h.total_size = size;
+    h.sequence = base;
+
+    rc = control_exchange(c, &h, dirty + (base >> 3), len, buffer, sizeof(buffer), &in,
+                          &payload, &payload_len);
+    if (rc != SS_OK) {
+        return rc;
+    }
+    if (in.msg_type == SS_NACK) {
+        return note_nack(c, &in, payload, payload_len);
+    }
+    if (in.msg_type != SS_ACK) {
+        return SS_ERR_PROTOCOL;
+    }
+    return SS_OK;
+}
+
+/* Declare every window of `dirty`. One datagram covers 8192 chunks, so a card
+ * up to 8 MiB needs one and a 16 MiB card needs two. */
+static int declare_delta(ss_client *c, const char *game_id, uint8_t slot,
+                         uint32_t transfer_id, uint32_t size, const uint8_t *dirty,
+                         uint32_t chunks)
+{
+    const uint32_t window = (uint32_t)SS_MAX_PAYLOAD * 8u;
+    uint32_t base;
+
+    for (base = 0; base < chunks; base += window) {
+        uint32_t left = chunks - base;
+        size_t len = (size_t)((left < window ? left : window) + 7u) / 8u;
+        int rc = declare_window(c, game_id, slot, transfer_id, size, dirty, base, len);
+
+        if (rc != SS_OK) {
+            return rc;
+        }
+    }
+    return SS_OK;
+}
+
+/* Whether `dirty` has a bit set at or past `chunks`.
+ *
+ * Those bits would be declared to the server, which refuses a chunk index past
+ * the end of the transfer -- so catch a caller's mistake here rather than as a
+ * malformed-header NACK halfway through a push. */
+static int declares_past_the_end(const uint8_t *dirty, uint32_t chunks)
+{
+    uint32_t bit;
+
+    for (bit = chunks; (bit & 7u) != 0; bit++) {
+        if (dirty[bit >> 3] & (1u << (bit & 7u))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The body of both ss_push and ss_push_delta.
+ *
+ * `dirty` NULL means send the whole card. Otherwise it names the chunks that
+ * changed, PUSH_BEGIN carries the delta flag, and the server seeds its staging
+ * buffer from `parent` instead of from zeros. Either way PUSH_END carries the
+ * digest of the whole image, so the server's seeding is verified rather than
+ * trusted -- see client.h and docs/PROTOCOL.md. */
+static int push_image(ss_client *c, const char *game_id, uint8_t slot,
+                      const uint8_t *image, uint32_t size, uint32_t parent,
+                      uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
+                      size_t bitmap_cap, uint32_t *out_version)
 {
     ss_datagram buffer;
     ss_header h;
@@ -201,6 +298,9 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
     uint8_t digest[SHA256_DIGEST_SIZE];
     uint32_t chunks;
     size_t needed;
+    int delta;
+    int began;
+    int attempt;
     int round;
     int rc;
 
@@ -212,32 +312,63 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
     if (bitmap_cap < needed) {
         return SS_ERR_TOO_BIG;
     }
+    if (dirty != NULL && declares_past_the_end(dirty, chunks)) {
+        return SS_ERR_PROTOCOL;
+    }
 
     sha256(image, size, digest);
 
     /* PUSH_BEGIN declares the transfer. control_exchange may resend it if the
      * reply is lost; that is safe because a repeat restarts the transfer
-     * server-side and no chunks have been sent yet. */
-    ss_header_init(&h, SS_PUSH_BEGIN, c->device_id, game_id, slot);
-    h.card_version = transfer_id;
-    h.parent_version = parent;
-    h.total_size = size;
+     * server-side and no chunks have been sent yet.
+     *
+     * Two attempts, not one: a server that cannot seed from `parent` answers
+     * NACK 0x0C, and the whole card goes instead. Without that fallback a
+     * pruned blob would make the card unpushable. */
+    delta = dirty != NULL;
+    began = 0;
+    for (attempt = 0; attempt < 2 && !began; attempt++) {
+        ss_header_init(&h, SS_PUSH_BEGIN, c->device_id, game_id, slot);
+        h.flags = delta ? SS_FLAG_DELTA : 0;
+        h.card_version = transfer_id;
+        h.parent_version = parent;
+        h.total_size = size;
 
-    rc = control_exchange(c, &h, NULL, 0, buffer, sizeof(buffer), &in, &payload,
-                          &payload_len);
-    if (rc != SS_OK) {
-        return rc;
-    }
-    if (in.msg_type == SS_NACK) {
+        rc = control_exchange(c, &h, NULL, 0, buffer, sizeof(buffer), &in, &payload,
+                              &payload_len);
+        if (rc != SS_OK) {
+            return rc;
+        }
+        if (in.msg_type == SS_ACK) {
+            began = 1;
+            break;
+        }
+        if (in.msg_type != SS_NACK) {
+            return SS_ERR_PROTOCOL;
+        }
+        if (delta && payload_len > 0 && payload[0] == SS_NACK_DELTA_UNAVAILABLE) {
+            delta = 0;
+            continue;
+        }
         return note_nack(c, &in, payload, payload_len);
     }
-    if (in.msg_type != SS_ACK) {
+    if (!began) {
         return SS_ERR_PROTOCOL;
     }
 
-    /* First round sends everything. */
+    if (delta) {
+        rc = declare_delta(c, game_id, slot, transfer_id, size, dirty, chunks);
+        if (rc != SS_OK) {
+            return rc;
+        }
+    }
+
+    /* First round sends everything the transfer is responsible for: the delta,
+     * or the whole card. */
     memset(bitmap, 0, needed);
-    {
+    if (delta) {
+        memcpy(bitmap, dirty, needed);
+    } else {
         uint32_t i;
         for (i = 0; i < chunks; i++) {
             ss_bitmap_set(bitmap, bitmap_cap, 0, i);
@@ -283,7 +414,10 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
 
         /* Gaps. The bitmap is windowed with its base in `sequence`, and the
          * server may send several windows, so gather them all before resending.
-         */
+         *
+         * On a delta the server names only what was declared -- but we hold the
+         * whole image either way, so a gap outside the declaration would be
+         * answered from it just the same. */
         memset(bitmap, 0, needed);
         for (;;) {
             uint32_t base = in.sequence;
@@ -322,6 +456,23 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
     }
 
     return SS_ERR_GAVE_UP;
+}
+
+int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *image,
+            uint32_t size, uint32_t parent, uint32_t transfer_id, uint8_t *bitmap,
+            size_t bitmap_cap, uint32_t *out_version)
+{
+    return push_image(c, game_id, slot, image, size, parent, transfer_id, NULL, bitmap,
+                      bitmap_cap, out_version);
+}
+
+int ss_push_delta(ss_client *c, const char *game_id, uint8_t slot,
+                  const uint8_t *image, uint32_t size, uint32_t parent,
+                  uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
+                  size_t bitmap_cap, uint32_t *out_version)
+{
+    return push_image(c, game_id, slot, image, size, parent, transfer_id, dirty, bitmap,
+                      bitmap_cap, out_version);
 }
 
 /* --- head --------------------------------------------------------------- */

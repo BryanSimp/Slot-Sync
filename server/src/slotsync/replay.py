@@ -3,7 +3,8 @@
 ## What is protected, and what deliberately is not
 
 Only **control** messages -- HELLO, PULL_REQ, PUSH_BEGIN, PUSH_END -- are
-checked. `PUSH_CHUNK` is not, for two reasons that both matter:
+checked. `PUSH_CHUNK` and `PUSH_DELTA` are not, for two reasons that both
+matter:
 
 1. Duplicate chunks are an explicitly supported operation. PLAN.md §4: "Chunks
    may arrive out of order and may be duplicated. Duplicates overwrite
@@ -15,6 +16,11 @@ checked. `PUSH_CHUNK` is not, for two reasons that both matter:
 
 Chunks are also the only high-volume message. Tracking 2048 nonces per transfer
 to protect an operation that is idempotent anyway would be paying for nothing.
+
+`PUSH_DELTA` is left out on the first ground alone: declaring a chunk twice sets
+a bit that is already set, so a client is free to resend the datagram it built
+rather than build a new one. It is acked, unlike a chunk, which is what makes
+resending it a thing a client actually does.
 
 ## What this requires of a client
 
@@ -35,6 +41,7 @@ from .protocol import MsgType
 GUARDED = frozenset(
     {MsgType.HELLO, MsgType.PULL_REQ, MsgType.PUSH_BEGIN, MsgType.PUSH_END}
 )
+assert MsgType.PUSH_CHUNK not in GUARDED and MsgType.PUSH_DELTA not in GUARDED
 
 
 class NonceCache:

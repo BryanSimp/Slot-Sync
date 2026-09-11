@@ -273,6 +273,143 @@ static void test_should_push(void)
 /* ------------------------------------------------------------------ */
 /* Live: the sequence SlotSync.c performs, against a real server        */
 /* ------------------------------------------------------------------ */
+/* Delta scan                                                          */
+/* ------------------------------------------------------------------ */
+
+#define DELTA_CARD_BYTES (64u * 1024u) /* 8 blocks, 64 chunks */
+
+static void test_delta_scan(void)
+{
+    static uint8_t card[DELTA_CARD_BYTES];
+    static uint32_t fp[DELTA_CARD_BYTES / SSL_BLOCK_SIZE];
+    static uint8_t dirty[DELTA_CARD_BYTES / SSL_CHUNK_SIZE / 8];
+    const uint32_t entries = DELTA_CARD_BYTES / SSL_BLOCK_SIZE;
+    const uint32_t chunks = DELTA_CARD_BYTES / SSL_CHUNK_SIZE;
+    int32_t marked;
+    uint32_t i;
+
+    printf("delta scan\n");
+
+    for (i = 0; i < DELTA_CARD_BYTES; i++) {
+        card[i] = (uint8_t)(i * 7u + 3u);
+    }
+    memset(fp, 0, sizeof(fp));
+
+    /* The first scan has nothing to compare against, so everything reads as
+     * changed. That is why SlotSync.c keeps fp_valid and pushes the first card
+     * of a session whole. */
+    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    check(marked == (int32_t)chunks, "the first scan marks the whole card");
+
+    /* And the table now describes the card, so an immediate re-scan is clean. */
+    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    check(marked == 0, "a card that has not changed marks nothing");
+    for (i = 0; i < sizeof(dirty); i++) {
+        if (dirty[i] != 0) {
+            break;
+        }
+    }
+    check(i == sizeof(dirty), "and leaves the bitmap empty");
+
+    /* One byte anywhere in a block dirties that block, and a block is eight
+     * chunks. Block granularity is the point: a GameCube card cannot be
+     * written in less than a block. */
+    card[SSL_BLOCK_SIZE * 3u + 17u] ^= 0xFFu;
+    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    check(marked == 8, "one changed byte marks one block, which is eight chunks");
+    for (i = 0; i < chunks; i++) {
+        int set = (dirty[i >> 3] >> (i & 7u)) & 1;
+        int expected = (i >= 24u && i < 32u);
+        if (set != expected) {
+            break;
+        }
+    }
+    check(i == chunks, "and marks exactly the chunks of that block");
+
+    /* Two bytes in the same block are still one block. */
+    card[SSL_BLOCK_SIZE * 5u] ^= 0x01u;
+    card[SSL_BLOCK_SIZE * 5u + SSL_BLOCK_SIZE - 1u] ^= 0x80u;
+    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    check(marked == 8, "two changes inside one block are still one block");
+
+    /* Changes in different blocks accumulate. */
+    card[0] ^= 0x01u;
+    card[SSL_BLOCK_SIZE * 7u] ^= 0x01u;
+    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    check(marked == 16, "two changed blocks are sixteen chunks");
+
+    /* A card larger than the table is not an error: the caller pushes it
+     * whole, exactly as every push did before delta existed. */
+    check(ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries - 1u, dirty, sizeof(dirty))
+              == -1,
+          "a card too big for the table declines rather than truncating");
+    check(ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, 1u) == -1,
+          "so does a bitmap too small to hold the answer");
+    check(ssl_delta_scan(NULL, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty)) == -1,
+          "and a missing card");
+    check(ssl_delta_scan(card, 0, fp, entries, dirty, sizeof(dirty)) == -1,
+          "and an empty one");
+
+    /* A card whose last block is short still scans: 4 Mbit is 64 whole blocks,
+     * but nothing in the format guarantees that forever. */
+    {
+        static uint32_t small_fp[3];
+        static uint8_t small_dirty[3];
+        uint32_t odd = SSL_BLOCK_SIZE * 2u + SSL_CHUNK_SIZE;
+
+        memset(small_fp, 0, sizeof(small_fp));
+        marked = ssl_delta_scan(card, odd, small_fp, 3, small_dirty,
+                                sizeof(small_dirty));
+        check(marked == 17, "a short final block is scanned, not skipped");
+    }
+}
+
+static void test_fingerprint(void)
+{
+    static uint8_t block[SSL_BLOCK_SIZE];
+    uint32_t base;
+    uint32_t i;
+    int differed = 1;
+
+    printf("fingerprints\n");
+
+    for (i = 0; i < SSL_BLOCK_SIZE; i++) {
+        block[i] = (uint8_t)(i & 0xFFu);
+    }
+    base = ssl_fingerprint(block, SSL_BLOCK_SIZE);
+
+    check(ssl_fingerprint(block, SSL_BLOCK_SIZE) == base, "the same bytes hash alike");
+
+    /* Every single-byte change has to move the hash, at the first byte, the
+     * last, and in between. A change that did not would hide a dirty block --
+     * the whole-card digest would catch it at PUSH_END, but at the cost of a
+     * wasted round. */
+    for (i = 0; i < SSL_BLOCK_SIZE; i += 37u) {
+        block[i] ^= 0x01u;
+        if (ssl_fingerprint(block, SSL_BLOCK_SIZE) == base) {
+            differed = 0;
+        }
+        block[i] ^= 0x01u;
+    }
+    block[SSL_BLOCK_SIZE - 1u] ^= 0x80u;
+    if (ssl_fingerprint(block, SSL_BLOCK_SIZE) == base) {
+        differed = 0;
+    }
+    block[SSL_BLOCK_SIZE - 1u] ^= 0x80u;
+    check(differed, "a one-bit change anywhere moves the fingerprint");
+
+    check(ssl_fingerprint(block, SSL_BLOCK_SIZE) == base, "and undoing it restores it");
+
+    printf("delta worth\n");
+    check(ssl_delta_worthwhile(8, 2048), "8 of 2048 chunks is worth a delta");
+    check(ssl_delta_worthwhile(472, 2048), "so is Animal Crossing's 472");
+    check(ssl_delta_worthwhile(0, 2048), "and so is a card that did not change");
+    check(!ssl_delta_worthwhile(1024, 2048), "half is not");
+    check(!ssl_delta_worthwhile(2048, 2048), "nor is all of it");
+    check(!ssl_delta_worthwhile(0, 0), "nor is a card with no chunks");
+}
+
+/* ------------------------------------------------------------------ */
 
 static void live(const char *host, unsigned short port, const char *psk,
                  const char *card_path, unsigned pace_every, unsigned pace_us)
@@ -407,6 +544,70 @@ static void live(const char *host, unsigned short port, const char *psk,
         free(back);
     }
 
+    /* Delta push, driven exactly the way ss_push_slot drives it: scan the card
+     * against the fingerprint table, then hand the bitmap to ss_push_delta.
+     *
+     * By this point `card` is byte for byte what the server holds at v`head`,
+     * which is the state SlotSync.c's fp_valid stands for. */
+    {
+        static uint32_t fp[2048];
+        static uint8_t dirty[2048];
+        uint32_t chunks = ss_chunk_count((uint32_t)len);
+        unsigned before;
+        int32_t marked;
+
+        memset(fp, 0, sizeof(fp));
+        marked = ssl_delta_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
+        check(marked >= 0, "the fingerprint table covers this card");
+
+        /* One save write: the file's own data, and the directory block the
+         * card keeps its entries in. */
+        card[0x2000 + 0x28] ^= 0x11; /* a directory entry's timestamp */
+        card[len / 2] ^= 0x77;       /* a data block in the middle */
+        marked = ssl_delta_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
+        check(marked == 16, "a save write dirties two blocks, so sixteen chunks");
+        check(ssl_delta_worthwhile((uint32_t)marked, chunks),
+              "which is well worth a delta");
+
+        parent = head;
+        before = sock.sent;
+        rc = ss_push_delta(&client, id, 0, card, (uint32_t)len, parent, parent + 1,
+                           dirty, bitmap, sizeof(bitmap), &head);
+        check(rc == SS_OK, "a delta push is accepted");
+        if (rc != SS_OK) {
+            printf("  %s (nack 0x%02x)\n", ss_strerror(rc), client.last_error_code);
+        } else {
+            check(head == parent + 1, "and moves the lineage on by one");
+            check(sock.sent - before < chunks / 4u,
+                  "sending a small fraction of the card");
+            printf("  delta: %u datagrams for a %u-chunk card, now v%u\n",
+                   sock.sent - before, chunks, head);
+        }
+
+        /* The assertion the whole feature rests on. The server spliced our
+         * sixteen chunks onto its own copy of v%u; if its copy was not the one
+         * we built the delta against, this is where it shows. */
+        if (rc == SS_OK) {
+            unsigned char *back = (unsigned char *)malloc((size_t)len);
+            uint32_t got_size = 0, got_version = 0;
+
+            if (back == NULL) {
+                printf("  FAIL  out of memory\n");
+                failures++;
+            } else {
+                rc = ss_pull(&client, id, 0, 0, back, (size_t)len, bitmap,
+                             sizeof(bitmap), &got_size, &got_version);
+                check(rc == SS_OK, "the delta result pulls back");
+                if (rc == SS_OK) {
+                    check(got_size == (uint32_t)len, "at the right size");
+                    check(memcmp(card, back, (size_t)len) == 0,
+                          "and the server assembled the card byte for byte");
+                }
+                free(back);
+            }
+        }
+    }
+
 done:
     host_socket_close(&sock);
     host_socket_cleanup();
@@ -447,6 +648,8 @@ int main(int argc, char **argv)
     test_state();
     test_game_id(card_path);
     test_should_push();
+    test_fingerprint();
+    test_delta_scan();
 
     if (host != NULL) {
         if (card_path == NULL) {

@@ -31,6 +31,12 @@ MAX_PAYLOAD = 1024
 
 MAX_DATAGRAM = HEADER_SIZE + MAX_PAYLOAD
 
+#: Header flags. Bit 0 on a PUSH_BEGIN asks the server to seed the staging
+#: buffer from `parent_version` rather than from zeros, so the client only has
+#: to send the chunks that changed -- docs/PROTOCOL.md, "Delta push".
+#: Every other message sends flags = 0.
+FLAG_DELTA = 0x0001
+
 #: `>` means big-endian and, importantly, no alignment padding.
 _HEADER = struct.Struct(">4sBBHQ6sBBIIIIII16s32s")
 assert _HEADER.size == HEADER_SIZE
@@ -46,6 +52,7 @@ class MsgType(IntEnum):
     NACK = 0x07
     PULL_CHUNK = 0x08
     HEARTBEAT = 0x09
+    PUSH_DELTA = 0x0A
 
 
 class Error(IntEnum):
@@ -60,6 +67,7 @@ class Error(IntEnum):
     TOO_LARGE = 0x09
     RATE_LIMITED = 0x0A
     STAGING_EXPIRED = 0x0B
+    DELTA_UNAVAILABLE = 0x0C
 
 
 ERROR_TEXT = {
@@ -74,6 +82,7 @@ ERROR_TEXT = {
     Error.TOO_LARGE: "too large",
     Error.RATE_LIMITED: "rate limited",
     Error.STAGING_EXPIRED: "staging buffer expired",
+    Error.DELTA_UNAVAILABLE: "cannot seed a delta from that parent version",
 }
 
 

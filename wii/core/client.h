@@ -89,6 +89,31 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
             uint32_t size, uint32_t parent, uint32_t transfer_id, uint8_t *bitmap,
             size_t bitmap_cap, uint32_t *out_version);
 
+/* Push only the chunks that changed since `parent` -- docs/PROTOCOL.md,
+ * "Delta push". Same arguments as ss_push plus:
+ *
+ * `dirty` is a bitmap, one bit per chunk, LSB-first and based at chunk 0, of
+ * the chunks whose bytes differ from the version the server holds as `parent`.
+ * Same sizing rule as `bitmap`, and it must have no bits set at or beyond
+ * ss_chunk_count(size). It is read, never written; `bitmap` is still the
+ * scratch.
+ *
+ * `image` is the caller's *whole* card, not the delta. PUSH_END carries the
+ * digest of all of it, which is what makes the server's seeding verifiable: if
+ * the server's copy of `parent` differs from what this client built its delta
+ * against, the assembled image hashes wrong and the push is refused rather than
+ * silently committing a spliced card.
+ *
+ * If the server cannot seed from `parent` -- pruned blob, unknown version, a
+ * card that changed size -- it answers NACK 0x0C and this falls back to sending
+ * the whole card by itself. The caller sees an ordinary success.
+ *
+ * Passing `dirty` as NULL is exactly ss_push. */
+int ss_push_delta(ss_client *c, const char *game_id, uint8_t slot,
+                  const uint8_t *image, uint32_t size, uint32_t parent,
+                  uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
+                  size_t bitmap_cap, uint32_t *out_version);
+
 /* Ask what version the server holds, without transferring the card.
  *
  * No new message type needed: a PULL_REQ whose payload is an all-zero bitmap
