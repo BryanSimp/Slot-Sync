@@ -452,6 +452,109 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
         free(other);
     }
 
+    /* Delta push -- docs/PROTOCOL.md, "Delta push".
+     *
+     * A save write touches its own blocks plus the directory and BAT, so the
+     * bytes that changed are a few percent of the card. Rewriting one 8 KiB
+     * block here stands in for that. */
+    {
+        unsigned char *dirty = (unsigned char *)calloc(4096, 1);
+        uint32_t chunks = ss_chunk_count((uint32_t)card_size);
+        uint32_t first = (uint32_t)((card_size / 2) / SS_MAX_PAYLOAD);
+        uint32_t per_block = 8192u / SS_MAX_PAYLOAD;
+        uint32_t delta_version = 0;
+        uint32_t ignored = 0;
+        unsigned before;
+        uint32_t i;
+
+        if (dirty == NULL) {
+            printf("  FAIL  out of memory\n");
+            failures++;
+            return 1;
+        }
+
+        for (i = 0; i < 8192u; i++) {
+            card[(card_size / 2) + i] ^= 0x5Au;
+        }
+        for (i = 0; i < per_block; i++) {
+            ss_bitmap_set(dirty, 4096, 0, first + i);
+        }
+
+        before = sock.sent;
+        rc = ss_push_delta(&client, game_id, 0, card, (uint32_t)card_size, version, 3,
+                           dirty, bitmap, 4096, &delta_version);
+        check(rc == SS_OK, "DELTA push");
+        if (rc != SS_OK) {
+            printf("        %s (nack 0x%02x: %s)\n", ss_strerror(rc),
+                   client.last_error_code,
+                   ss_strerror_nack(client.last_error_code));
+        } else {
+            unsigned spent = sock.sent - before;
+
+            check(delta_version == version + 1, "the delta landed on the next version");
+            /* begin, one manifest and end are three datagrams of overhead on
+             * top of the eight chunks. A whole-card push would be 2048. */
+            check(spent < chunks / 8u, "a delta sends a small fraction of the card");
+            printf("  delta: %u datagrams for a %u-chunk card, now v%u\n", spent, chunks,
+                   delta_version);
+
+            memset(pulled, 0, card_size);
+            rc = ss_pull(&client, game_id, 0, 0, pulled, card_size, bitmap, 4096,
+                         &got_size, &got_version);
+            check(rc == SS_OK, "PULL the delta result back");
+            check(memcmp(card, pulled, card_size) == 0,
+                  "the server assembled the card byte for byte");
+            version = delta_version;
+        }
+
+        /* A parent the server cannot seed from must not need handling by the
+         * caller: NACK 0x0c falls back to the whole card inside the client.
+         *
+         * v0 is unseedable by definition -- it is "the server has never seen
+         * this card". So this push gets its 0x0c, sends the whole card anyway,
+         * and is refused at PUSH_END as a stale parent. A conflict coming back
+         * rather than SS_ERR_SERVER with 0x0c is what proves the fallback ran,
+         * and the datagram count proves it sent the whole card rather than the
+         * eight chunks the bitmap named.
+         *
+         * The card has to differ from head for that to be a conflict at all:
+         * store.push answers an identical re-push as a no-op before it ever
+         * looks at the parent. */
+        card[0x200] ^= 0xFFu;
+        before = sock.sent;
+        /* Paced, alone among the pushes here. By this point the run has spent
+         * three cards' worth of the server's token bucket, and a fourth
+         * unpaced 2 MiB push runs it dry -- which answers 0x0a and hides
+         * whatever this test was actually asking. A console paces anyway. */
+        sock.pace_every = 512;
+        sock.pace_us = 400000;
+        rc = ss_push_delta(&client, game_id, 0, card, (uint32_t)card_size, 0, 4, dirty,
+                           bitmap, 4096, &ignored);
+        sock.pace_every = 0;
+        sock.pace_us = 0;
+        check(rc == SS_ERR_CONFLICT,
+              "an unseedable delta falls back to a whole-card push");
+        if (rc != SS_ERR_CONFLICT) {
+            printf("        got %s (nack 0x%02x: %s)\n", ss_strerror(rc),
+                   client.last_error_code,
+                   ss_strerror_nack(client.last_error_code));
+        }
+        check(sock.sent - before > chunks,
+              "the fallback really did send the whole card");
+        printf("  fallback sent %u datagrams for the same card\n", sock.sent - before);
+        card[0x200] ^= 0xFFu;
+
+        /* A dirty bitmap naming a chunk past the end of the card is the
+         * caller's bug, and is caught before anything reaches the wire. */
+        memset(dirty, 0xFF, 4096);
+        rc = ss_push_delta(&client, game_id, 0, card, (uint32_t)card_size, version, 5,
+                           dirty, bitmap, 4096, &ignored);
+        check(rc == SS_ERR_PROTOCOL || chunks % 8u == 0,
+              "a delta naming a chunk past the end is refused locally");
+
+        free(dirty);
+    }
+
     free(card);
     free(pulled);
     free(bitmap);

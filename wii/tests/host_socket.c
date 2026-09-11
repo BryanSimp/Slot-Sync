@@ -124,6 +124,7 @@ int host_socket_send(void *ctx, const unsigned char *data, size_t len)
     struct sockaddr_in *addr = (struct sockaddr_in *)&s->addr;
 
     host_socket_pace(s);
+    s->sent++;
 
     if (should_drop(s)) {
         s->dropped_out++;

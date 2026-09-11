@@ -13,6 +13,8 @@ from both sides at once.
     python scripts/fake_console.py --psk KEY pull GALE01 A out.raw
     python scripts/fake_console.py --psk KEY push GALE01 A card.raw --parent 0 \\
         --loss 0.2 --reorder
+    python scripts/fake_console.py --psk KEY push GALE01 A new.raw --parent 7 \\
+        --delta-from old.raw
 """
 
 from __future__ import annotations
@@ -36,7 +38,11 @@ HMAC_OFFSET = 64
 MAX_PAYLOAD = 1024
 
 HELLO, PULL_REQ, PUSH_BEGIN, PUSH_CHUNK, PUSH_END = 0x01, 0x02, 0x03, 0x04, 0x05
-ACK, NACK, PULL_CHUNK, HEARTBEAT = 0x06, 0x07, 0x08, 0x09
+ACK, NACK, PULL_CHUNK, HEARTBEAT, PUSH_DELTA = 0x06, 0x07, 0x08, 0x09, 0x0A
+
+#: Header flags bit 0, on a PUSH_BEGIN: seed the staging buffer from
+#: parent_version instead of from zeros. See docs/PROTOCOL.md, "Delta push".
+FLAG_DELTA = 0x0001
 
 ERRORS = {
     0x01: "bad hmac",
@@ -50,6 +56,7 @@ ERRORS = {
     0x09: "too large",
     0x0A: "rate limited",
     0x0B: "staging buffer expired",
+    0x0C: "delta unavailable: cannot seed from that parent",
 }
 
 
@@ -73,13 +80,14 @@ def build(
     total_size=0,
     sequence=0,
     payload=b"",
+    flags=0,
 ) -> bytes:
     """Pack and sign one datagram."""
     header = HEADER.pack(
         MAGIC,
         VERSION,
         msg_type,
-        0,
+        flags,
         device_id,
         game_id.encode("ascii")[:6].ljust(6, b" "),
         slot,
@@ -242,6 +250,26 @@ def do_hello(link: Link, device_id: int) -> int:
     return 0
 
 
+def changed_chunks(image: bytes, previous: bytes) -> list[int]:
+    """Chunk indices where `image` differs from `previous`.
+
+    Stands in for what the kernel client does with its per-block fingerprints.
+    The two cards must be the same size; a resized card cannot be a delta.
+    """
+    if len(image) != len(previous):
+        raise ProtocolError(
+            f"delta base is {len(previous)} bytes, image is {len(image)} -- "
+            f"a resized card has to be pushed whole"
+        )
+    chunks = (len(image) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
+    return [
+        i
+        for i in range(chunks)
+        if image[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD]
+        != previous[i * MAX_PAYLOAD : (i + 1) * MAX_PAYLOAD]
+    ]
+
+
 def do_push(
     link: Link,
     device_id,
@@ -252,6 +280,7 @@ def do_push(
     transfer_id: int,
     rounds: int,
     pace: float,
+    delta_from: Path | None = None,
 ) -> int:
     image = path.read_bytes()
     total = len(image)
@@ -267,19 +296,68 @@ def do_push(
             **kw,
         )
 
-    print(f"pushing {path.name}: {total} bytes, {chunks} chunks, parent={parent}")
+    delta = None if delta_from is None else changed_chunks(image, delta_from.read_bytes())
 
-    link.send(
-        build(
+    print(f"pushing {path.name}: {total} bytes, {chunks} chunks, parent={parent}")
+    if delta is not None:
+        print(
+            f"  delta against v{parent}: {len(delta)} of {chunks} chunks "
+            f"({100.0 * len(delta) / chunks:.1f}%)"
+        )
+
+    def begin(as_delta: bool) -> bytes:
+        return build(
             link.key,
             PUSH_BEGIN,
             total_size=total,
             parent_version=parent,
+            flags=FLAG_DELTA if as_delta else 0,
             **head(PUSH_BEGIN),
-        ),
-        lossy=False,
-    )
-    link.expect(ACK, "PUSH_BEGIN")
+        )
+
+    link.send(begin(delta is not None), lossy=False)
+    reply = link.recv(lossy=False)
+    if reply is None:
+        raise ProtocolError("timed out waiting for the PUSH_BEGIN reply")
+
+    if reply["msg_type"] == NACK and reply["payload"][:1] == b"\x0c":
+        # The server cannot seed from that parent: pruned blob, unknown
+        # version, or the card changed size. Not a conflict and not our fault --
+        # send the whole card instead. A client without this fallback finds a
+        # card unpushable the moment its parent blob is pruned.
+        print("  server cannot seed the delta (0x0c); pushing the whole card")
+        delta = None
+        link.send(begin(False), lossy=False)
+        reply = link.recv(lossy=False)
+        if reply is None:
+            raise ProtocolError("timed out waiting for the PUSH_BEGIN reply")
+
+    if reply["msg_type"] != ACK:
+        code = reply["payload"][0] if reply["payload"] else 0
+        raise ProtocolError(f"PUSH_BEGIN: NACK 0x{code:02x} {ERRORS.get(code, '?')}")
+
+    if delta is not None:
+        # Declare what is coming, one window per datagram, each acked. A lost
+        # declaration would otherwise surface at PUSH_END as a digest failure
+        # and cost a whole-card restart.
+        window = (MAX_PAYLOAD - 1) * 8
+        for base in sorted({(i // window) * window for i in delta}):
+            here = [i for i in delta if base <= i < base + window]
+            # Trim to the highest index in this window rather than always
+            # sending a full 1023 bytes: the server walks whatever bytes arrive.
+            bitmap = build_bitmap(here, base, window)[: (max(here) - base) // 8 + 1]
+            link.send(
+                build(
+                    link.key,
+                    PUSH_DELTA,
+                    sequence=base,
+                    total_size=total,
+                    payload=bitmap,
+                    **head(PUSH_DELTA),
+                ),
+                lossy=False,
+            )
+            link.expect(ACK, "PUSH_DELTA")
 
     def chunk_datagram(index: int) -> bytes:
         offset = index * MAX_PAYLOAD
@@ -293,7 +371,7 @@ def do_push(
             **head(PUSH_CHUNK),
         )
 
-    outstanding = list(range(chunks))
+    outstanding = list(range(chunks)) if delta is None else list(delta)
     for attempt in range(1, rounds + 1):
         link.send_many([chunk_datagram(i) for i in outstanding], pace=pace)
 
@@ -444,6 +522,16 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="client-chosen id echoed through the transfer",
     )
+    push.add_argument(
+        "--delta-from",
+        type=Path,
+        default=None,
+        metavar="OLD.raw",
+        help=(
+            "send only the chunks that differ from this image, which must be "
+            "the bytes of --parent as the server holds them"
+        ),
+    )
 
     pull = sub.add_parser("pull")
     pull.add_argument("game_id")
@@ -482,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.transfer_id,
                 args.rounds,
                 args.pace,
+                args.delta_from,
             )
         return do_pull(
             link, args.device, args.game_id, slot, args.path, args.version, args.rounds

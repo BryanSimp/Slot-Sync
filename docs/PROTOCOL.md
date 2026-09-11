@@ -15,7 +15,7 @@ off  size  field
 0    4     magic, ASCII "SLOT"
 4    1     version = 1
 5    1     msg_type
-6    2     flags (reserved, send 0)
+6    2     flags, bit 0 = DELTA (see below); send 0 on every other message
 8    8     device_id, u64
 16   6     game_id, ASCII, space-padded, e.g. "GALE01"
 22   1     slot, 0 = A, 1 = B
@@ -47,6 +47,7 @@ payload, keyed by the pre-shared key.
 | 0x07 | NACK | S→C | 1-byte error code, then a bitmap of missing chunk indices |
 | 0x08 | PULL_CHUNK | S→C | up to 1024 bytes at `offset` |
 | 0x09 | HEARTBEAT | C→S | none |
+| 0x0A | PUSH_DELTA | C→S | bitmap of the chunks this push will send; base in `sequence` |
 
 ## Error codes
 
@@ -62,6 +63,7 @@ payload, keyed by the pre-shared key.
 0x09  too large
 0x0A  rate limited
 0x0B  staging buffer expired
+0x0C  delta unavailable: cannot seed from that parent
 ```
 
 ## Push sequence
@@ -263,3 +265,121 @@ why it was being ignored.
 
 An oversized `PUSH_BEGIN` is refused before a buffer is allocated, so `total_size` is
 never a lever on server memory.
+
+---
+
+# Delta push (M11)
+
+Every push above sends the whole card. On the kernel client that is 2048 datagrams for a
+2 MiB card and 16384 for a 16 MiB one, at a paced 400 datagrams/sec — 5.1 s and 41 s of
+transfer while a game is running. A save write touches its own data blocks plus one
+directory block and one BAT block, so the bytes that actually changed are typically 2–5%
+of the card.
+
+A delta push sends only those chunks. Same protocol, fewer chunks — `PLAN.md` §2 said it
+would be.
+
+## Sequence
+
+```
+C→S  PUSH_BEGIN   flags=0x0001, total_size=2097152, parent_version=7
+S→C  ACK                                   (or NACK 0x0C — fall back to a whole-card push)
+C→S  PUSH_DELTA   sequence=0, payload = bitmap of the chunks that changed
+S→C  ACK          sequence=0
+C→S  PUSH_CHUNK   only the declared chunks
+C→S  PUSH_END     payload = sha256 of the WHOLE card image, not of the delta
+S→C  ACK          card_version=8
+```
+
+`PUSH_BEGIN` with **flags bit 0** asks the server to seed the staging buffer with the
+bytes of `parent_version` instead of zeros. Everything the client does not send is
+therefore the parent's bytes.
+
+## Why this does not violate "never merge two cards"
+
+`CLAUDE.md` forbids merging two memory cards at the byte level, and seeding a buffer from
+one card and overwriting parts of it with another is exactly that shape. What makes it
+legal is the digest:
+
+**`PUSH_END` still carries the SHA-256 of the client's whole card image.** The client
+computes it over its own complete 2 MiB, not over what it sent. If the server's copy of
+`parent_version` differs from the client's copy in even one byte — a divergence the
+client does not know about, a blob that rotted, a bug in either fingerprint — the
+assembled image hashes wrong and is refused with `0x07`, exactly as a torn whole-card
+push is today.
+
+So the merge is *verified*, never assumed. The client is still committing to a specific
+whole card; the wire is just not carrying the parts the server already has. Nothing about
+the conflict rule changes: `parent_version` must still be head at commit time or the push
+is refused with `0x05`, and a human still chooses.
+
+## `PUSH_DELTA`, 0x0A
+
+Payload is a bare bitmap — no leading error byte, the same shape a `PULL_REQ` payload
+has — based at the header's `sequence`. It declares the chunks this transfer will send.
+
+One datagram covers 8192 chunks, so cards up to 8 MiB need one and a 16 MiB card needs
+two. Each is acked with the same `sequence`, so a lost declaration is retried rather than
+discovered at `PUSH_END`. Without the ack, one lost datagram would make the server
+believe the delta was empty, fail the digest, and cost a whole-card restart.
+
+`PUSH_DELTA` is **not** nonce-guarded, for the same reason `PUSH_CHUNK` is not: declaring
+a chunk twice sets a bit that was already set. A client may resend the datagram it
+already built.
+
+A repeated `PUSH_BEGIN` restarts the transfer and discards the declaration along with the
+chunks.
+
+## Gaps
+
+`NACK 0x06` names only chunks the client declared. Everything else is the parent's bytes
+and was never in flight, so it cannot be missing.
+
+A client always holds the whole image, so it can satisfy any gap the server names,
+including one it never declared. A delta push therefore degrades into a whole-card push
+without any special handling.
+
+## `NACK 0x0C`, delta unavailable
+
+The server cannot seed from `parent_version`:
+
+- it has no such version for this card,
+- the blob has been pruned, or
+- that version's card is a different size from `total_size`.
+
+None of these are errors on the client's part, and none are conflicts. The client retries
+immediately as a whole-card push. **A client that implements delta push must implement
+this fallback**, or a pruned blob makes a card unpushable.
+
+## What it costs the server
+
+`PUSH_BEGIN` now reads the parent blob — up to 16 MiB off disk — before it acks, on a
+thread so the loop keeps serving. Peak memory is unchanged: the staging buffer was always
+`total_size` bytes, it is just no longer zeros.
+
+## Measured
+
+Chunks sent for one save, by the size of the save:
+
+| Save | Blocks | Chunks sent | 2 MiB card | 16 MiB card |
+|---|---|---|---|---|
+| Sonic Adventure 2 | 2 | 32 | 1.6% | 0.2% |
+| Wind Waker | 3 | 40 | 2.0% | 0.2% |
+| Metroid Prime | 4 | 48 | 2.3% | 0.3% |
+| Melee | 11 | 104 | 5.1% | 0.6% |
+| Animal Crossing | 57 | 472 | 23% | 2.9% |
+
+Data blocks plus one directory block and one BAT block, at `docs/MEMCARD.md`'s 8 KiB
+block size. At the kernel client's 400 datagrams/sec that turns a 5.1 s push of a 2 MiB
+card into 0.26 s, and a 41 s push of a 16 MiB card into the same 0.26 s — the cost stops
+scaling with the card and starts scaling with the save.
+
+## Delta pull is not implemented
+
+The kernel client never pulls a card; it only asks `ss_head`, which is two datagrams. So
+delta pull would only help the libogc launcher, and it is left undone.
+
+The wire format already has room for it and no new message type is needed: `PULL_REQ`
+already takes a bitmap of wanted chunks, and its `parent_version` field is unused. A
+client naming the version it already holds there, with flags bit 0 set, would let the
+server diff two blobs it has on disk and send a manifest plus only the differing chunks.

@@ -13,6 +13,11 @@ Shape of the thing:
   may be duplicated; duplicates overwrite the same bytes harmlessly. Nothing is
   committed until PUSH_END arrives *and* the SHA-256 matches, so a client that
   loses power mid-transfer never disturbs the current head.
+- A *delta* push seeds that buffer from the parent version rather than from
+  zeros, so the client only sends the chunks that changed. The PUSH_END digest
+  still covers the client's whole card, which is what keeps the seeding honest:
+  bytes the server supplied that the client did not expect fail the digest and
+  are refused, exactly as a torn whole-card push is.
 - The server never sends unsolicited. Every datagram out is a reply.
 """
 
@@ -31,6 +36,7 @@ from dataclasses import dataclass, field
 from . import __version__
 from .config import Config
 from .protocol import (
+    FLAG_DELTA,
     MAX_PAYLOAD,
     Error,
     Message,
@@ -76,12 +82,41 @@ class Staging:
     expected: int
     #: One bit per chunk index, LSB-first, so a duplicate is free to detect.
     received: bytearray
+    #: True when `data` was seeded from the parent version rather than zeroed,
+    #: so only the chunks named in PUSH_DELTA are ever in flight.
+    is_delta: bool = False
+    #: On a delta, the chunks the client said it would send. One bit each, same
+    #: shape as `received`. Unused on a whole-card push, where every chunk is
+    #: expected.
+    declared: bytearray = field(default_factory=bytearray)
     received_count: int = 0
+    #: Declared chunks that have not arrived. Maintained incrementally rather
+    #: than recomputed, because a declaration and the chunk it names may arrive
+    #: in either order and each has to be able to settle the other.
+    outstanding: int = 0
     last_chunk_at: float = field(default_factory=time.monotonic)
 
     @property
     def complete(self) -> bool:
+        if self.is_delta:
+            return self.outstanding == 0
         return self.received_count >= self.expected
+
+    def declare(self, sequence: int) -> bool:
+        """Record that the client intends to send chunk `sequence`.
+
+        Idempotent: declaring twice sets a bit that is already set, which is why
+        PUSH_DELTA needs no replay protection.
+        """
+        if sequence >= self.expected:
+            return False
+        byte, bit = sequence >> 3, 1 << (sequence & 7)
+        if self.declared[byte] & bit:
+            return True
+        self.declared[byte] |= bit
+        if not self.received[byte] & bit:
+            self.outstanding += 1
+        return True
 
     def store_chunk(self, sequence: int, offset: int, payload: bytes) -> bool:
         """Record one chunk. False if it does not fit the declared transfer."""
@@ -95,10 +130,24 @@ class Staging:
         if not self.received[byte] & bit:
             self.received[byte] |= bit
             self.received_count += 1
+            if self.is_delta and self.declared[byte] & bit:
+                self.outstanding -= 1
         self.last_chunk_at = time.monotonic()
         return True
 
     def missing(self) -> list[int]:
+        """Chunks still owed.
+
+        On a delta that is the declared-but-unreceived set: everything else is
+        the parent's bytes and was never in flight, so it cannot be missing.
+        """
+        if self.is_delta:
+            return [
+                index
+                for index in range(self.expected)
+                if self.declared[index >> 3] & (1 << (index & 7))
+                and not self.received[index >> 3] & (1 << (index & 7))
+            ]
         return [
             index
             for index in range(self.expected)
@@ -290,6 +339,7 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
             MsgType.HELLO: self._on_hello,
             MsgType.HEARTBEAT: self._on_heartbeat,
             MsgType.PUSH_BEGIN: self._on_push_begin,
+            MsgType.PUSH_DELTA: self._on_push_delta,
             MsgType.PUSH_END: self._on_push_end,
             MsgType.PULL_REQ: self._on_pull_req,
         }
@@ -343,10 +393,23 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
             self._nack(message, addr, Error.RATE_LIMITED)
             return
 
+        is_delta = bool(message.flags & FLAG_DELTA)
+        if is_delta:
+            seed = await self._seed_from_parent(message)
+            if seed is None:
+                # Not the client's fault and not a conflict: it retries as a
+                # whole-card push. A client without that fallback would find a
+                # card unpushable the moment its parent blob was pruned.
+                self._nack(message, addr, Error.DELTA_UNAVAILABLE)
+                return
+        else:
+            seed = bytearray(message.total_size)
+
         expected = chunk_count(message.total_size)
         # A repeated PUSH_BEGIN restarts the transfer: the client is retrying,
         # and keeping half-filled bytes from a previous attempt is how you get a
-        # card that passes its checksum and is still wrong.
+        # card that passes its checksum and is still wrong. The delta
+        # declaration is discarded with them, for the same reason.
         self.staging[key] = Staging(
             total_size=message.total_size,
             parent_version=message.parent_version,
@@ -354,9 +417,11 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
             game_id=message.game_id,
             slot=message.slot,
             addr=addr,
-            data=bytearray(message.total_size),
+            data=seed,
             expected=expected,
             received=bytearray((expected + 7) // 8),
+            is_delta=is_delta,
+            declared=bytearray((expected + 7) // 8),
         )
         log.info(
             "push begins",
@@ -367,8 +432,77 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
                 "total_size": message.total_size,
                 "chunks": expected,
                 "parent": message.parent_version,
+                "delta": is_delta,
             },
         )
+        self._send(reply_to(message, MsgType.ACK), addr)
+
+    async def _seed_from_parent(self, message: Message) -> bytearray | None:
+        """The parent version's bytes, for a delta push to overwrite parts of.
+
+        None means this delta cannot be served -- no such version, a pruned
+        blob, or a card that has changed size since. All three are answered with
+        NACK 0x0C and are the client's cue to send the whole card instead.
+        """
+        if message.parent_version == 0:
+            # v0 is "the card the server has never seen". There is nothing to
+            # seed from, and a delta against it would commit mostly zeros.
+            return None
+        try:
+            version = self.store.get_version(
+                message.game_id, message.slot, message.parent_version
+            )
+            image = await asyncio.to_thread(self.store.read_image, version)
+        except (NotFoundError, ValidationError) as exc:
+            log.info(
+                "delta refused, cannot seed",
+                extra={
+                    "game_id": message.game_id,
+                    "slot": message.slot,
+                    "parent": message.parent_version,
+                    "detail": str(exc),
+                },
+            )
+            return None
+
+        if len(image) != message.total_size:
+            log.info(
+                "delta refused, the card changed size",
+                extra={
+                    "game_id": message.game_id,
+                    "slot": message.slot,
+                    "parent": message.parent_version,
+                    "parent_size": len(image),
+                    "total_size": message.total_size,
+                },
+            )
+            return None
+        return bytearray(image)
+
+    def _on_push_delta(self, message: Message, addr) -> None:
+        """One window of the chunk bitmap a delta push will send.
+
+        Acked, unlike a chunk: a lost declaration would otherwise leave the
+        server believing the delta was empty, and that is only discovered at
+        PUSH_END as a digest failure -- costing a whole-card restart for one
+        dropped datagram.
+        """
+        staging = self.staging.get(_key(message))
+        if staging is None:
+            self._nack(message, addr, Error.STAGING_EXPIRED)
+            return
+        if not staging.is_delta:
+            # The transfer was not opened with the delta flag, so seeding never
+            # happened and everything outside the declaration would be zeros.
+            self._nack(message, addr, Error.MALFORMED_HEADER)
+            return
+
+        for sequence in unpack_bitmap(message.payload, message.sequence):
+            if not staging.declare(sequence):
+                self._nack(message, addr, Error.MALFORMED_HEADER)
+                return
+
+        staging.last_chunk_at = time.monotonic()
         self._send(reply_to(message, MsgType.ACK), addr)
 
     def _on_push_chunk(self, message: Message, addr) -> None:
@@ -396,7 +530,11 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
                     "peer": _peer(addr),
                     "game_id": staging.game_id,
                     "missing": len(missing),
+                    # On a delta only the declared chunks were ever owed, so
+                    # `expected` on its own reads as far worse than it is.
                     "expected": staging.expected,
+                    "delta": staging.is_delta,
+                    "outstanding": staging.outstanding,
                 },
             )
             self._nack_missing(message, addr, missing)
