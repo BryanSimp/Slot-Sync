@@ -231,10 +231,23 @@ int ssl_config_parse(const char *text, ssl_config *cfg)
     return 0;
 }
 
+/* One hex digit, or -1. */
+static int ssl_hex(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 int ssl_state_find(const char *text, const char *game_id, uint8_t slot,
-                   uint32_t *out)
+                   uint32_t *out, uint8_t sha256[32])
 {
     const char *p;
+
+    if (sha256 != NULL) {
+        memset(sha256, 0, 32);
+    }
 
     for (p = text; *p != '\0'; p = ssl_next_line(p)) {
         const char *cursor = p;
@@ -259,6 +272,27 @@ int ssl_state_find(const char *text, const char *game_id, uint8_t slot,
             continue;
         }
         *out = (uint32_t)ssl_parse_u64(cursor, &cursor);
+
+        /* The digest of that version, when the caller wants it. A line without
+         * one is still a usable lineage -- the launcher wrote versions before
+         * it wrote digests -- so a short or malformed field leaves the digest
+         * zeroed rather than failing the lookup. A zeroed digest matches no
+         * fingerprint record, which is the safe way to be missing one. */
+        if (sha256 != NULL) {
+            while (*cursor == ' ' || *cursor == '\t') {
+                cursor++;
+            }
+            for (i = 0; i < 32; i++) {
+                int hi = ssl_hex(cursor[i * 2]);
+                int lo = ssl_hex(cursor[i * 2 + 1]);
+
+                if (hi < 0 || lo < 0) {
+                    memset(sha256, 0, 32);
+                    break;
+                }
+                sha256[i] = (uint8_t)((hi << 4) | lo);
+            }
+        }
         return 0;
     }
     return -1;
@@ -297,83 +331,4 @@ int ssl_should_push(int dirty, int halted, uint32_t since_dirty, uint32_t since_
         return 0;
     }
     return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Delta push                                                          */
-/* ------------------------------------------------------------------ */
-
-uint32_t ssl_fingerprint(const uint8_t *data, uint32_t len)
-{
-    /* FNV-1a, 32 bit. The multiplier is odd, so each step is invertible and a
-     * change to any byte always changes the result -- which is the property
-     * that matters here. Offset basis and prime are the published ones. */
-    uint32_t hash = 2166136261u;
-    uint32_t i;
-
-    for (i = 0; i < len; i++) {
-        hash ^= (uint32_t)data[i];
-        hash *= 16777619u;
-    }
-    return hash;
-}
-
-int32_t ssl_delta_scan(const uint8_t *card, uint32_t size, uint32_t *fp,
-                       uint32_t fp_entries, uint8_t *dirty, uint32_t dirty_bytes)
-{
-    uint32_t blocks;
-    uint32_t chunks;
-    uint32_t needed;
-    uint32_t marked = 0;
-    uint32_t block;
-
-    if (card == NULL || fp == NULL || dirty == NULL || size == 0) {
-        return -1;
-    }
-
-    blocks = (size + SSL_BLOCK_SIZE - 1u) / SSL_BLOCK_SIZE;
-    chunks = (size + SSL_CHUNK_SIZE - 1u) / SSL_CHUNK_SIZE;
-    needed = (chunks + 7u) / 8u;
-
-    /* Too big for the table this build carries. Not an error -- the caller
-     * pushes the whole card, exactly as it did before delta existed. */
-    if (blocks > fp_entries || dirty_bytes < needed) {
-        return -1;
-    }
-
-    memset(dirty, 0, needed);
-
-    for (block = 0; block < blocks; block++) {
-        uint32_t offset = block * SSL_BLOCK_SIZE;
-        uint32_t left = size - offset;
-        uint32_t len = left < SSL_BLOCK_SIZE ? left : SSL_BLOCK_SIZE;
-        uint32_t hash = ssl_fingerprint(card + offset, len);
-        uint32_t first;
-        uint32_t chunk;
-
-        if (hash == fp[block]) {
-            continue;
-        }
-        fp[block] = hash;
-
-        first = offset / SSL_CHUNK_SIZE;
-        for (chunk = first;
-             chunk < first + (SSL_BLOCK_SIZE / SSL_CHUNK_SIZE) && chunk < chunks;
-             chunk++) {
-            dirty[chunk >> 3] |= (uint8_t)(1u << (chunk & 7u));
-            marked++;
-        }
-    }
-
-    return (int32_t)marked;
-}
-
-int ssl_delta_worthwhile(uint32_t marked, uint32_t chunks)
-{
-    /* Half. A delta costs the server one read of the parent blob, and below
-     * that ratio the read is cheap against the datagrams it saves; above it,
-     * the card may as well go whole and leave the blob alone. The real cases
-     * are nowhere near the line -- one save is a few percent of a card -- so
-     * this only has to catch "most of the card changed", not be tuned. */
-    return chunks > 0 && marked * 2u < chunks;
 }

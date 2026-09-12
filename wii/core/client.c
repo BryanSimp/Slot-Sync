@@ -278,17 +278,17 @@ static int declares_past_the_end(const uint8_t *dirty, uint32_t chunks)
     return 0;
 }
 
-/* The body of both ss_push and ss_push_delta.
+/* One attempt at a push, delta or whole.
  *
  * `dirty` NULL means send the whole card. Otherwise it names the chunks that
  * changed, PUSH_BEGIN carries the delta flag, and the server seeds its staging
  * buffer from `parent` instead of from zeros. Either way PUSH_END carries the
  * digest of the whole image, so the server's seeding is verified rather than
  * trusted -- see client.h and docs/PROTOCOL.md. */
-static int push_image(ss_client *c, const char *game_id, uint8_t slot,
-                      const uint8_t *image, uint32_t size, uint32_t parent,
-                      uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
-                      size_t bitmap_cap, uint32_t *out_version)
+static int push_once(ss_client *c, const char *game_id, uint8_t slot,
+                     const uint8_t *image, uint32_t size, uint32_t parent,
+                     uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
+                     size_t bitmap_cap, uint32_t *out_version)
 {
     ss_datagram buffer;
     ss_header h;
@@ -317,6 +317,10 @@ static int push_image(ss_client *c, const char *game_id, uint8_t slot,
     }
 
     sha256(image, size, digest);
+    /* Kept for the caller: a fingerprint table that outlives the push has to
+     * record the digest of the image it describes, and hashing a 2 MiB card
+     * twice to learn something we just computed would be silly. */
+    memcpy(c->last_digest, digest, SHA256_DIGEST_SIZE);
 
     /* PUSH_BEGIN declares the transfer. control_exchange may resend it if the
      * reply is lost; that is safe because a repeat restarts the transfer
@@ -462,8 +466,8 @@ int ss_push(ss_client *c, const char *game_id, uint8_t slot, const uint8_t *imag
             uint32_t size, uint32_t parent, uint32_t transfer_id, uint8_t *bitmap,
             size_t bitmap_cap, uint32_t *out_version)
 {
-    return push_image(c, game_id, slot, image, size, parent, transfer_id, NULL, bitmap,
-                      bitmap_cap, out_version);
+    return push_once(c, game_id, slot, image, size, parent, transfer_id, NULL, bitmap,
+                     bitmap_cap, out_version);
 }
 
 int ss_push_delta(ss_client *c, const char *game_id, uint8_t slot,
@@ -471,8 +475,31 @@ int ss_push_delta(ss_client *c, const char *game_id, uint8_t slot,
                   uint32_t transfer_id, const uint8_t *dirty, uint8_t *bitmap,
                   size_t bitmap_cap, uint32_t *out_version)
 {
-    return push_image(c, game_id, slot, image, size, parent, transfer_id, dirty, bitmap,
-                      bitmap_cap, out_version);
+    int rc = push_once(c, game_id, slot, image, size, parent, transfer_id, dirty, bitmap,
+                       bitmap_cap, out_version);
+
+    /* A delta that assembled into something we did not mean.
+     *
+     * The server seeded from its copy of `parent` and our chunks landed on top,
+     * and the result does not hash to the card we are holding -- so its copy of
+     * the parent is not the image our dirty bitmap was computed against. That
+     * is exactly the check that makes delta push safe (PLAN.md 5), and here it
+     * has fired.
+     *
+     * It costs a round, not a card: nothing was committed, and we hold the
+     * whole image. Send all of it rather than hand the failure back, because
+     * the caller's only sensible response would be to do this anyway -- and a
+     * caller that did not would leave the card stuck, retrying the same bad
+     * delta on every save.
+     *
+     * Only once, and only for a delta. A whole-card push that fails its digest
+     * is a torn image or a broken link, and resending it is not a fix. */
+    if (dirty != NULL && rc == SS_ERR_SERVER
+        && c->last_error_code == SS_NACK_CHECKSUM) {
+        rc = push_once(c, game_id, slot, image, size, parent, transfer_id, NULL, bitmap,
+                       bitmap_cap, out_version);
+    }
+    return rc;
 }
 
 /* --- head --------------------------------------------------------------- */

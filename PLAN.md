@@ -549,12 +549,41 @@ The console finds the changed set from a table of per-block fingerprints, not fr
 Nintendont's own dirty range: that range is a span rather than a set, so one touch at
 each end of the card dirties everything between, and reading it would need another hook
 into a file this project only patches 61 lines of. Four bytes per 8 KiB block, updated in
-one pass over a card that is already being hashed for `PUSH_END` anyway.
+one pass over a card that is already being hashed for `PUSH_END` anyway. M12 puts that
+table on the SD card, which is what makes it worth anything to the launcher or to the
+first push of a session.
 
 *Done when:* a delta lands over real sockets and the card pulls back byte-identical, and
 a server that cannot seed from the named parent is handled by the client rather than by
 the caller. **Done** — 11 datagrams for a 2048-chunk card in the host tests, and a
 pruned parent blob falls back to a whole-card push without the caller seeing it.
+
+**M12 — The fingerprint store**
+M11 left two gaps, both from the table living only in RAM. The kernel's was empty at every
+boot, so the first push of each session was a whole card — 5 s of a 2 MiB one, 41 s of a
+16 MiB one, while a game was running. The libogc launcher's was worse: it is a fresh
+process every launch, so it could never delta at all and every menu push sent everything.
+
+So the table goes on the SD card, in a file both sides share. `core/fingerprint.c` owns
+the format and the scan — one implementation, linked by the launcher and vendored into the
+kernel by `apply.sh`, because this is not the wire protocol and a second copy would buy
+nothing but drift.
+
+Two files, mirroring `state.txt` and `runtime.txt` exactly: the launcher writes
+`fingerprints.bin` covering every card it tracks, the kernel writes `runtime-fp.bin` for
+the one game that just ran, and the launcher merges it on the way back. A kernel that
+rewrote the shared file would clobber 63 other cards' tables to say something about one.
+
+A table is only used when its record's version, card size **and** digest all match what
+`state.txt` says the card descends from — the digest being the one that says the table was
+taken from those exact bytes rather than from something that carried the same number. Two
+nets under that, both in `ss_push_delta` rather than in either caller: `NACK 0x0c` when the
+server cannot seed, and `NACK 0x07` when a delta assembles into something the client did
+not mean. Either resends the whole card once, so a stale table costs a round, never a card.
+
+*Done when:* a table survives being written, forgotten and read back, and the push that
+follows is still a delta. **Done** — 11 datagrams for a 2048-chunk card across a simulated
+reboot, pulled back byte-identical, in `wii/tests`.
 
 **Delta pull is deliberately not part of this.** The kernel client never pulls a card, so
 it would only help the libogc launcher. `docs/PROTOCOL.md` records where it would go: no

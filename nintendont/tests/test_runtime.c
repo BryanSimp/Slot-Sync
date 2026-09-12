@@ -23,6 +23,7 @@
 
 #include "../kernel/SlotSyncLogic.h"
 #include "../../wii/core/client.h"
+#include "../../wii/core/fingerprint.h"
 #include "../../wii/core/protocol.h"
 #include "../../wii/core/sha256.h"
 #include "../../wii/tests/host_socket.h"
@@ -142,18 +143,18 @@ static void test_state(void)
 
     printf("state file\n");
 
-    check(ssl_state_find(state, "GALE01", 0, &version) == 0 && version == 7,
+    check(ssl_state_find(state, "GALE01", 0, &version, NULL) == 0 && version == 7,
           "slot A version");
-    check(ssl_state_find(state, "GALE01", 1, &version) == 0 && version == 3,
+    check(ssl_state_find(state, "GALE01", 1, &version, NULL) == 0 && version == 3,
           "slot B of the same game is a different card");
-    check(ssl_state_find(state, "GM4E01", 0, &version) == 0 && version == 12,
+    check(ssl_state_find(state, "GM4E01", 0, &version, NULL) == 0 && version == 12,
           "a later line");
-    check(ssl_state_find(state, "GZLE01", 0, &version) != 0, "an unknown card");
-    check(ssl_state_find("", "GALE01", 0, &version) != 0, "an empty state file");
+    check(ssl_state_find(state, "GZLE01", 0, &version, NULL) != 0, "an unknown card");
+    check(ssl_state_find("", "GALE01", 0, &version, NULL) != 0, "an empty state file");
 
     /* A six-character ID must match all six. "GALE0" is a prefix of the first
      * line's ID and must not match it. */
-    check(ssl_state_find(state, "GALE0 ", 0, &version) != 0,
+    check(ssl_state_find(state, "GALE0 ", 0, &version, NULL) != 0,
           "a prefix does not match");
 }
 
@@ -281,10 +282,10 @@ static void test_should_push(void)
 static void test_delta_scan(void)
 {
     static uint8_t card[DELTA_CARD_BYTES];
-    static uint32_t fp[DELTA_CARD_BYTES / SSL_BLOCK_SIZE];
-    static uint8_t dirty[DELTA_CARD_BYTES / SSL_CHUNK_SIZE / 8];
-    const uint32_t entries = DELTA_CARD_BYTES / SSL_BLOCK_SIZE;
-    const uint32_t chunks = DELTA_CARD_BYTES / SSL_CHUNK_SIZE;
+    static uint32_t fp[DELTA_CARD_BYTES / SS_FP_BLOCK_SIZE];
+    static uint8_t dirty[DELTA_CARD_BYTES / SS_FP_CHUNK_SIZE / 8];
+    const uint32_t entries = DELTA_CARD_BYTES / SS_FP_BLOCK_SIZE;
+    const uint32_t chunks = DELTA_CARD_BYTES / SS_FP_CHUNK_SIZE;
     int32_t marked;
     uint32_t i;
 
@@ -298,11 +299,11 @@ static void test_delta_scan(void)
     /* The first scan has nothing to compare against, so everything reads as
      * changed. That is why SlotSync.c keeps fp_valid and pushes the first card
      * of a session whole. */
-    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    marked = ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
     check(marked == (int32_t)chunks, "the first scan marks the whole card");
 
     /* And the table now describes the card, so an immediate re-scan is clean. */
-    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    marked = ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
     check(marked == 0, "a card that has not changed marks nothing");
     for (i = 0; i < sizeof(dirty); i++) {
         if (dirty[i] != 0) {
@@ -314,8 +315,8 @@ static void test_delta_scan(void)
     /* One byte anywhere in a block dirties that block, and a block is eight
      * chunks. Block granularity is the point: a GameCube card cannot be
      * written in less than a block. */
-    card[SSL_BLOCK_SIZE * 3u + 17u] ^= 0xFFu;
-    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    card[SS_FP_BLOCK_SIZE * 3u + 17u] ^= 0xFFu;
+    marked = ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
     check(marked == 8, "one changed byte marks one block, which is eight chunks");
     for (i = 0; i < chunks; i++) {
         int set = (dirty[i >> 3] >> (i & 7u)) & 1;
@@ -327,27 +328,27 @@ static void test_delta_scan(void)
     check(i == chunks, "and marks exactly the chunks of that block");
 
     /* Two bytes in the same block are still one block. */
-    card[SSL_BLOCK_SIZE * 5u] ^= 0x01u;
-    card[SSL_BLOCK_SIZE * 5u + SSL_BLOCK_SIZE - 1u] ^= 0x80u;
-    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    card[SS_FP_BLOCK_SIZE * 5u] ^= 0x01u;
+    card[SS_FP_BLOCK_SIZE * 5u + SS_FP_BLOCK_SIZE - 1u] ^= 0x80u;
+    marked = ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
     check(marked == 8, "two changes inside one block are still one block");
 
     /* Changes in different blocks accumulate. */
     card[0] ^= 0x01u;
-    card[SSL_BLOCK_SIZE * 7u] ^= 0x01u;
-    marked = ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
+    card[SS_FP_BLOCK_SIZE * 7u] ^= 0x01u;
+    marked = ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty));
     check(marked == 16, "two changed blocks are sixteen chunks");
 
     /* A card larger than the table is not an error: the caller pushes it
      * whole, exactly as every push did before delta existed. */
-    check(ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries - 1u, dirty, sizeof(dirty))
+    check(ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries - 1u, dirty, sizeof(dirty))
               == -1,
           "a card too big for the table declines rather than truncating");
-    check(ssl_delta_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, 1u) == -1,
+    check(ss_fp_scan(card, DELTA_CARD_BYTES, fp, entries, dirty, 1u) == -1,
           "so does a bitmap too small to hold the answer");
-    check(ssl_delta_scan(NULL, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty)) == -1,
+    check(ss_fp_scan(NULL, DELTA_CARD_BYTES, fp, entries, dirty, sizeof(dirty)) == -1,
           "and a missing card");
-    check(ssl_delta_scan(card, 0, fp, entries, dirty, sizeof(dirty)) == -1,
+    check(ss_fp_scan(card, 0, fp, entries, dirty, sizeof(dirty)) == -1,
           "and an empty one");
 
     /* A card whose last block is short still scans: 4 Mbit is 64 whole blocks,
@@ -355,10 +356,10 @@ static void test_delta_scan(void)
     {
         static uint32_t small_fp[3];
         static uint8_t small_dirty[3];
-        uint32_t odd = SSL_BLOCK_SIZE * 2u + SSL_CHUNK_SIZE;
+        uint32_t odd = SS_FP_BLOCK_SIZE * 2u + SS_FP_CHUNK_SIZE;
 
         memset(small_fp, 0, sizeof(small_fp));
-        marked = ssl_delta_scan(card, odd, small_fp, 3, small_dirty,
+        marked = ss_fp_scan(card, odd, small_fp, 3, small_dirty,
                                 sizeof(small_dirty));
         check(marked == 17, "a short final block is scanned, not skipped");
     }
@@ -366,47 +367,148 @@ static void test_delta_scan(void)
 
 static void test_fingerprint(void)
 {
-    static uint8_t block[SSL_BLOCK_SIZE];
+    static uint8_t block[SS_FP_BLOCK_SIZE];
     uint32_t base;
     uint32_t i;
     int differed = 1;
 
     printf("fingerprints\n");
 
-    for (i = 0; i < SSL_BLOCK_SIZE; i++) {
+    for (i = 0; i < SS_FP_BLOCK_SIZE; i++) {
         block[i] = (uint8_t)(i & 0xFFu);
     }
-    base = ssl_fingerprint(block, SSL_BLOCK_SIZE);
+    base = ss_fp_hash(block, SS_FP_BLOCK_SIZE);
 
-    check(ssl_fingerprint(block, SSL_BLOCK_SIZE) == base, "the same bytes hash alike");
+    check(ss_fp_hash(block, SS_FP_BLOCK_SIZE) == base, "the same bytes hash alike");
 
     /* Every single-byte change has to move the hash, at the first byte, the
      * last, and in between. A change that did not would hide a dirty block --
      * the whole-card digest would catch it at PUSH_END, but at the cost of a
      * wasted round. */
-    for (i = 0; i < SSL_BLOCK_SIZE; i += 37u) {
+    for (i = 0; i < SS_FP_BLOCK_SIZE; i += 37u) {
         block[i] ^= 0x01u;
-        if (ssl_fingerprint(block, SSL_BLOCK_SIZE) == base) {
+        if (ss_fp_hash(block, SS_FP_BLOCK_SIZE) == base) {
             differed = 0;
         }
         block[i] ^= 0x01u;
     }
-    block[SSL_BLOCK_SIZE - 1u] ^= 0x80u;
-    if (ssl_fingerprint(block, SSL_BLOCK_SIZE) == base) {
+    block[SS_FP_BLOCK_SIZE - 1u] ^= 0x80u;
+    if (ss_fp_hash(block, SS_FP_BLOCK_SIZE) == base) {
         differed = 0;
     }
-    block[SSL_BLOCK_SIZE - 1u] ^= 0x80u;
+    block[SS_FP_BLOCK_SIZE - 1u] ^= 0x80u;
     check(differed, "a one-bit change anywhere moves the fingerprint");
 
-    check(ssl_fingerprint(block, SSL_BLOCK_SIZE) == base, "and undoing it restores it");
+    check(ss_fp_hash(block, SS_FP_BLOCK_SIZE) == base, "and undoing it restores it");
 
     printf("delta worth\n");
-    check(ssl_delta_worthwhile(8, 2048), "8 of 2048 chunks is worth a delta");
-    check(ssl_delta_worthwhile(472, 2048), "so is Animal Crossing's 472");
-    check(ssl_delta_worthwhile(0, 2048), "and so is a card that did not change");
-    check(!ssl_delta_worthwhile(1024, 2048), "half is not");
-    check(!ssl_delta_worthwhile(2048, 2048), "nor is all of it");
-    check(!ssl_delta_worthwhile(0, 0), "nor is a card with no chunks");
+    check(ss_fp_worthwhile(8, 2048), "8 of 2048 chunks is worth a delta");
+    check(ss_fp_worthwhile(472, 2048), "so is Animal Crossing's 472");
+    check(ss_fp_worthwhile(0, 2048), "and so is a card that did not change");
+    check(!ss_fp_worthwhile(1024, 2048), "half is not");
+    check(!ss_fp_worthwhile(2048, 2048), "nor is all of it");
+    check(!ss_fp_worthwhile(0, 0), "nor is a card with no chunks");
+}
+
+/* ------------------------------------------------------------------ */
+/* The fingerprint store, read the way the kernel reads it             */
+/* ------------------------------------------------------------------ */
+/*
+ * SlotSync.c cannot slurp the file: a 16 MiB card's table is 8 KiB against a
+ * 16 KiB stack, and the kernel has no heap to put it on. So it walks the file
+ * sequentially -- header, then a record header at a time, taking the
+ * fingerprints of the one card it wants a slice at a time and reading past
+ * everyone else's.
+ *
+ * That walk is in SlotSync.c and needs FatFs, so it cannot run here. What can
+ * run here is the decoding it does at each step, against bytes laid out exactly
+ * as the file lays them out. If these agree, the only thing left untested in
+ * the kernel's loader is f_read.
+ */
+
+static void test_kernel_store_walk(void)
+{
+    uint8_t store[SS_FP_HEADER_SIZE + 2 * (SS_FP_RECORD_SIZE + 64 * 4)];
+    uint32_t table[64];
+    ss_fp_record rec;
+    size_t at = 0;
+    uint32_t values[64];
+    uint32_t i;
+    int walked = 0;
+
+    printf("fingerprint store, walked in slices\n");
+
+    /* Two cards, 512 KiB each, so 64 blocks apiece. */
+    ss_fp_put_header(store, 2);
+    at = SS_FP_HEADER_SIZE;
+
+    for (i = 0; i < 2; i++) {
+        ss_fp_record out;
+        uint32_t b;
+
+        memset(&out, 0, sizeof(out));
+        memcpy(out.game_id, i == 0 ? "GM4E01" : "GALE01", SS_GAME_ID_LEN);
+        out.game_id[SS_GAME_ID_LEN] = '\0';
+        out.slot = 0;
+        out.version = i == 0 ? 3u : 12u;
+        out.size = 512u * 1024u;
+        out.blocks = ss_fp_blocks(out.size);
+        memset(out.sha256, (int)(0x40 + i), SS_FP_DIGEST_SIZE);
+
+        for (b = 0; b < out.blocks; b++) {
+            values[b] = (i == 0 ? 0xAAAA0000u : 0xBBBB0000u) + b;
+        }
+        ss_fp_put_record(store + at, &out);
+        at += SS_FP_RECORD_SIZE;
+        ss_fp_put_values(store + at, values, out.blocks);
+        at += out.blocks * 4u;
+    }
+
+    check(ss_fp_store_count(store, SS_FP_HEADER_SIZE) == 2,
+          "the header alone says how many records follow");
+
+    /* Now the walk, using only what the kernel has: a record header at a time,
+     * and values in slices of sixteen. */
+    {
+        size_t offset = SS_FP_HEADER_SIZE;
+        int r;
+
+        for (r = 0; r < 2; r++) {
+            uint32_t left;
+            uint32_t into = 0;
+
+            check(ss_fp_get_record(&rec, store + offset) == 0,
+                  "each record header decodes on its own");
+            offset += SS_FP_RECORD_SIZE;
+
+            if (memcmp(rec.game_id, "GALE01", SS_GAME_ID_LEN) != 0) {
+                offset += rec.blocks * 4u; /* read past a card we do not want */
+                continue;
+            }
+
+            check(rec.version == 12u, "the wanted record carries its version");
+            check(rec.size == 512u * 1024u, "and its card size");
+            check(rec.blocks == 64u, "and a block count that matches it");
+
+            left = rec.blocks;
+            while (left > 0) {
+                uint32_t take = left < 16u ? left : 16u;
+
+                ss_fp_get_values(table + into, store + offset + into * 4u, take);
+                into += take;
+                left -= take;
+            }
+            for (i = 0; i < rec.blocks; i++) {
+                if (table[i] != 0xBBBB0000u + i) {
+                    break;
+                }
+            }
+            check(i == rec.blocks,
+                  "and its fingerprints survive being taken sixteen at a time");
+            walked = 1;
+        }
+    }
+    check(walked, "the second card is reached by reading past the first");
 }
 
 /* ------------------------------------------------------------------ */
@@ -557,16 +659,16 @@ static void live(const char *host, unsigned short port, const char *psk,
         int32_t marked;
 
         memset(fp, 0, sizeof(fp));
-        marked = ssl_delta_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
+        marked = ss_fp_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
         check(marked >= 0, "the fingerprint table covers this card");
 
         /* One save write: the file's own data, and the directory block the
          * card keeps its entries in. */
         card[0x2000 + 0x28] ^= 0x11; /* a directory entry's timestamp */
         card[len / 2] ^= 0x77;       /* a data block in the middle */
-        marked = ssl_delta_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
+        marked = ss_fp_scan(card, (uint32_t)len, fp, 2048, dirty, sizeof(dirty));
         check(marked == 16, "a save write dirties two blocks, so sixteen chunks");
-        check(ssl_delta_worthwhile((uint32_t)marked, chunks),
+        check(ss_fp_worthwhile((uint32_t)marked, chunks),
               "which is well worth a delta");
 
         parent = head;
@@ -650,6 +752,7 @@ int main(int argc, char **argv)
     test_should_push();
     test_fingerprint();
     test_delta_scan();
+    test_kernel_store_walk();
 
     if (host != NULL) {
         if (card_path == NULL) {
