@@ -186,6 +186,9 @@ None of those failed loudly. Most looked exactly like "the server is unreachable
   still has to fit, and nobody has run one.
 - **Delta push on hardware.** It works over real sockets in `tests/` and the card pulls
   back byte-identical, but no console has sent one.
+- **The fingerprint store on hardware.** The format round-trips and a reloaded table
+  deltas correctly in `wii/tests`, but the kernel's own reader and writer are FatFs and
+  have only ever run against a host stand-in for the bytes.
 
 ## Testing it
 
@@ -232,8 +235,8 @@ wire format and `PLAN.md` §5 for why that digest is what lets a byte-level spli
 with "never merge two cards".
 
 **The changed set comes from fingerprints, not from Nintendont's dirty range.** The kernel
-keeps one 32-bit fingerprint per 8 KiB block — `ssl_delta_scan` in `SlotSyncLogic.c`, so it
-is testable off a console — and compares on each push. Nintendont's `GCNCard_ctx` does
+keeps one 32-bit fingerprint per 8 KiB block — `ss_fp_scan` in `core/fingerprint.c`, so it
+is testable off a console and shared with the launcher — and compares on each push. Nintendont's `GCNCard_ctx` does
 track a dirty range of its own, but it is a *range*: a game touching the directory at the
 front and a save block in the middle dirties everything between. Reading it would also need
 another hook into a file this project only patches 61 lines of. The scan is one pass over a
@@ -243,7 +246,25 @@ Block granularity rather than chunk is not a compromise: a GameCube card is eras
 written in 8 KiB blocks, so a game cannot change less than one. One dirty block is eight
 dirty chunks.
 
-Two things to know if you touch this:
+**The table is on disk, so the first push of a session is a delta too.** Held only in RAM
+it was empty at every boot, and each session opened with a whole card: 5 s of a 2 MiB one,
+41 s of a 16 MiB one, while the game was running. Now `SlotSync_Init` reads the launcher's
+`/slotsync/fingerprints.bin` and `SlotSync_Shutdown` writes `/slotsync/runtime-fp.bin` for
+the launcher to merge — the same two-file split as `state.txt` and `runtime.txt`, for the
+same reason: the launcher's store covers every card it tracks and this kernel knows about
+the one game that just ran, so rewriting the shared file from here would clobber the rest.
+
+A loaded table is only used when the record's **version, card size and digest** all match
+what `state.txt` says the card descends from. A state file written before digests were
+recorded leaves the digest zeroed, and then the version and size carry it alone.
+
+The file is walked sequentially rather than read into memory: a 16 MiB card's table is
+8 KiB against a 16 KiB stack, and there is no heap here. Record headers come 56 bytes at a
+time and fingerprints in 512-byte slices, so nothing needs a buffer bigger than
+`SS_FP_SLICE`. Only `f_read` — no `f_lseek` — so a card we do not want is read past rather
+than seeked over.
+
+Three things to know if you touch this:
 
 - **The table is only usable while it describes what the server committed.**
   `ssl_delta_scan` updates it in place, so between the scan and the ack it describes bytes
@@ -253,6 +274,11 @@ Two things to know if you touch this:
 - **A server that cannot seed answers `NACK 0x0c`,** and `ss_push_delta` retries as a
   whole-card push by itself. Nothing in `SlotSync.c` handles it. Without that fallback a
   pruned parent blob would make a card unpushable.
+- **A delta that assembles wrong answers `NACK 0x07`,** and `ss_push_delta` resends the
+  whole card once. That is the net under a table read off an SD card: if the file does not
+  describe the bytes the server holds, the push still lands, one round later. Only for a
+  delta — a whole-card push that fails its digest is a torn image, and resending it is not
+  a fix.
 
 The table costs 8 KiB of BSS (`SS_FP_ENTRIES`), split between the slots, which caps a
 delta-capable card at 16 MiB with one slot enabled and 8 MiB each with two. A card over its
@@ -260,3 +286,6 @@ share scans as `-1` and is pushed whole.
 
 The 30 s cooldown is now conservative rather than necessary — it was sized for a 5 s
 transfer. Lowering `runtime_cooldown_ms` is the obvious next thing to try on hardware.
+
+Deleting `/slotsync/fingerprints.bin` breaks nothing: the next push of each card is whole
+and rebuilds it.

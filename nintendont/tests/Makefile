@@ -24,7 +24,7 @@ endif
 CORE    := ../../wii/core
 SOURCES := test_runtime.c ../kernel/SlotSyncLogic.c \
 	   $(CORE)/sha256.c $(CORE)/protocol.c $(CORE)/client.c $(CORE)/memcard.c \
-	   ../../wii/tests/host_socket.c
+	   $(CORE)/fingerprint.c ../../wii/tests/host_socket.c
 
 test_runtime: $(SOURCES) ../kernel/SlotSyncLogic.h
 	$(CC) $(CFLAGS) -o $@ $(SOURCES) $(LDLIBS)

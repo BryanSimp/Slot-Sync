@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "protocol.h"
+#include "sha256.h"
 
 /* Chunks a pull asks for per round. The card arrives as an unsolicited burst
  * and the console holds only about forty datagrams of it, so a window larger
@@ -55,6 +56,12 @@ typedef struct {
     /* Populated after a call, for reporting. */
     uint32_t last_head;      /* on SS_CONFLICT, the server's head version */
     uint8_t last_error_code; /* the NACK code, when one arrived */
+    /* The digest ss_push/ss_push_delta computed over the image, left here
+     * rather than returned because the caller wants it only sometimes: a
+     * persisted fingerprint table has to record which image it describes, and
+     * this is that image's digest without hashing the card a second time. Only
+     * meaningful after a push that returned SS_OK. */
+    uint8_t last_digest[SHA256_DIGEST_SIZE];
 } ss_client;
 
 /* Result codes. Negative is failure; SS_CONFLICT is a decision for a human,

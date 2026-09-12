@@ -6,6 +6,7 @@
 
 CC      ?= gcc
 CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 -g
+CFLAGS  += -I../core -I../source
 LDLIBS  :=
 
 # Winsock needs an explicit link. $(OS) is not reliably exported into make's
@@ -21,9 +22,11 @@ ifneq (,$(findstring CYGWIN,$(UNAME)))
 LDLIBS += -lws2_32
 endif
 
-SOURCES := test_core.c host_socket.c ../core/sha256.c ../core/protocol.c ../core/client.c
+SOURCES := test_core.c host_socket.c ../core/sha256.c ../core/protocol.c \
+	   ../core/client.c ../core/fingerprint.c ../source/wii_fingerprint.c
 
-test_core: $(SOURCES) ../core/sha256.h ../core/protocol.h ../core/client.h host_socket.h
+test_core: $(SOURCES) ../core/sha256.h ../core/protocol.h ../core/client.h \
+	   ../core/fingerprint.h host_socket.h
 	$(CC) $(CFLAGS) -o $@ $(SOURCES) $(LDLIBS)
 
 .PHONY: check clean

@@ -89,7 +89,7 @@ index 5f65844..1630e65 100644
 +	   SDI.o usb.o usbstorage.o wdvd.o sock.o \
 +	   SlotSync.o SlotSyncNet.o SlotSyncLogic.o \
 +	   slotsync/protocol.o slotsync/client.o slotsync/sha256.o \
-+	   slotsync/memcard.o
++	   slotsync/memcard.o slotsync/fingerprint.o
  LIBS	:= ../fatfs/libfatfs-arm.a be/libc.a be/libgcc.a
  ZIPFILE	:= ../loader/data/kernel.zip
  

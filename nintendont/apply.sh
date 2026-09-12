@@ -46,7 +46,8 @@ cp "$HERE/kernel/SlotSyncNet.h"   "$ND/kernel/"
 
 echo "==> vendoring the protocol core from wii/core"
 mkdir -p "$ND/kernel/slotsync"
-for f in protocol.c protocol.h client.c client.h sha256.c sha256.h memcard.c memcard.h; do
+for f in protocol.c protocol.h client.c client.h sha256.c sha256.h memcard.c \
+	 memcard.h fingerprint.c fingerprint.h; do
 	cp "$REPO/wii/core/$f" "$ND/kernel/slotsync/$f"
 done
 

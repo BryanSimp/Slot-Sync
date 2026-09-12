@@ -18,6 +18,8 @@
 #include <time.h>
 
 #include "../core/client.h"
+#include "../core/fingerprint.h"
+#include "../source/wii_fingerprint.h"
 #include "../core/protocol.h"
 #include "../core/sha256.h"
 #include "host_socket.h"
@@ -250,6 +252,277 @@ static void test_bitmaps(void)
     check(ss_chunk_count(16777216) == 16384, "chunk count of a 16 MiB card");
 }
 
+/* --- the fingerprint store ---------------------------------------------- */
+/*
+ * core/fingerprint.c and source/wii_fingerprint.c. The store is what lets a
+ * push send only the blocks that changed *across a reboot* -- without it the
+ * table is empty at every start, so the launcher could never delta at all and
+ * the kernel opened every session with a whole card.
+ */
+
+#define FP_STORE "test_fp_store.bin"
+#define FP_INCOMING "test_fp_runtime.bin"
+#define FP_ENTRIES 2048
+
+static void fill_record(ss_fp_record *rec, const char *game_id, uint8_t slot,
+                        uint32_t version, uint32_t size, uint8_t seed)
+{
+    int i;
+
+    memset(rec, 0, sizeof(*rec));
+    strncpy(rec->game_id, game_id, SS_GAME_ID_LEN);
+    rec->game_id[SS_GAME_ID_LEN] = '\0';
+    rec->slot = slot;
+    rec->version = version;
+    rec->size = size;
+    rec->blocks = ss_fp_blocks(size);
+    for (i = 0; i < SS_FP_DIGEST_SIZE; i++) {
+        rec->sha256[i] = (uint8_t)(seed + i);
+    }
+}
+
+static void test_fp_store(void)
+{
+    static uint32_t fp[FP_ENTRIES];
+    static uint32_t back[FP_ENTRIES];
+    ss_fp_record rec;
+    ss_fp_record got;
+    wii_fp_store store;
+    uint32_t i;
+
+    printf("fingerprint store\n");
+
+    remove(FP_STORE);
+    remove(FP_INCOMING);
+
+    /* One card in, the same card out. */
+    fill_record(&rec, "GALE01", 0, 7, 2u * 1024u * 1024u, 0x10);
+    for (i = 0; i < rec.blocks; i++) {
+        fp[i] = 0xA5000000u + i;
+    }
+    check(wii_fp_store_put(FP_STORE, &rec, fp) == 0, "a table can be stored");
+
+    wii_fp_store_read(&store, FP_STORE);
+    check(store.bytes != NULL, "and read back");
+    check(wii_fp_store_get(&store, "GALE01", 0, &got, back, FP_ENTRIES) == 0,
+          "and found by game id and slot");
+    check(got.version == 7 && got.size == rec.size && got.blocks == rec.blocks,
+          "with its version, size and block count");
+    check(memcmp(got.sha256, rec.sha256, SS_FP_DIGEST_SIZE) == 0,
+          "and the digest of the image it describes");
+    for (i = 0; i < rec.blocks; i++) {
+        if (back[i] != fp[i]) {
+            break;
+        }
+    }
+    check(i == rec.blocks, "and every fingerprint intact through the round trip");
+
+    /* A card that is not in the store is simply not found. */
+    check(wii_fp_store_get(&store, "GM4E01", 0, &got, back, FP_ENTRIES) != 0,
+          "a card with no record is not found");
+    check(wii_fp_store_get(&store, "GALE01", 1, &got, back, FP_ENTRIES) != 0,
+          "and neither is the other slot of one that is");
+    wii_fp_store_free(&store);
+
+    /* A second card must not displace the first. This is the whole reason the
+     * kernel writes its own file rather than rewriting this one: clobbering
+     * every other card's table to say something about one would be a poor
+     * trade. */
+    {
+        ss_fp_record second;
+
+        fill_record(&second, "GM4E01", 0, 3, 512u * 1024u, 0x40);
+        for (i = 0; i < second.blocks; i++) {
+            fp[i] = 0x5C000000u + i;
+        }
+        check(wii_fp_store_put(FP_STORE, &second, fp) == 0, "a second card stores");
+
+        wii_fp_store_read(&store, FP_STORE);
+        check(ss_fp_store_count(store.bytes, store.len) == 2, "the store holds both");
+        check(wii_fp_store_get(&store, "GALE01", 0, &got, back, FP_ENTRIES) == 0
+                  && got.version == 7,
+              "and the first card survived the second being written");
+        check(wii_fp_store_get(&store, "GM4E01", 0, &got, back, FP_ENTRIES) == 0
+                  && got.version == 3,
+              "as did the second");
+        check(back[0] == 0x5C000000u, "with the right card's fingerprints");
+        wii_fp_store_free(&store);
+    }
+
+    /* Replacing a card updates it rather than leaving two. */
+    fill_record(&rec, "GALE01", 0, 8, 2u * 1024u * 1024u, 0x99);
+    for (i = 0; i < rec.blocks; i++) {
+        fp[i] = 0xBEEF0000u + i;
+    }
+    check(wii_fp_store_put(FP_STORE, &rec, fp) == 0, "a card can be replaced");
+    wii_fp_store_read(&store, FP_STORE);
+    check(ss_fp_store_count(store.bytes, store.len) == 2,
+          "and the store still holds two records, not three");
+    check(wii_fp_store_get(&store, "GALE01", 0, &got, back, FP_ENTRIES) == 0
+              && got.version == 8 && back[0] == 0xBEEF0000u,
+          "with the newer table");
+    wii_fp_store_free(&store);
+
+    /* The checks that decide whether a table may be trusted. Each one on its
+     * own is what stands between a delta and naming the wrong chunks. */
+    check(wii_fp_usable(&got, 8, 2u * 1024u * 1024u, rec.sha256),
+          "a record matching version, size and digest is usable");
+    check(!wii_fp_usable(&got, 9, 2u * 1024u * 1024u, rec.sha256),
+          "a record for another version is not");
+    check(!wii_fp_usable(&got, 8, 4u * 1024u * 1024u, rec.sha256),
+          "nor one for another card size");
+    {
+        uint8_t wrong[SS_FP_DIGEST_SIZE];
+
+        memcpy(wrong, rec.sha256, SS_FP_DIGEST_SIZE);
+        wrong[0] ^= 0xFFu;
+        check(!wii_fp_usable(&got, 8, 2u * 1024u * 1024u, wrong),
+              "nor one whose digest says it came from other bytes");
+    }
+
+    remove(FP_STORE);
+}
+
+static void test_fp_store_is_defensive(void)
+{
+    static uint32_t fp[FP_ENTRIES];
+    ss_fp_record rec;
+    uint8_t header[SS_FP_HEADER_SIZE];
+
+    printf("fingerprint store, damaged\n");
+
+    /* The file comes off an SD card a user can put anything on, so nothing in
+     * it may be trusted to be self-consistent. */
+    check(ss_fp_store_count(NULL, 0) < 0, "no store at all");
+    check(ss_fp_store_count(header, 3) < 0, "a store shorter than its header");
+
+    ss_fp_put_header(header, 1);
+    check(ss_fp_store_count(header, sizeof(header)) == 1, "a good header reads");
+
+    header[0] = 'X';
+    check(ss_fp_store_count(header, sizeof(header)) < 0, "bad magic is refused");
+
+    ss_fp_put_header(header, 1);
+    header[4] = SS_FP_FORMAT + 1;
+    check(ss_fp_store_count(header, sizeof(header)) < 0, "a future format is refused");
+
+    /* A file taken at a different block size describes blocks that are not the
+     * ones we would compare, so it is not ours to read. */
+    ss_fp_put_header(header, 1);
+    ss_put_u32(header + 8, SS_FP_BLOCK_SIZE * 2u);
+    check(ss_fp_store_count(header, sizeof(header)) < 0,
+          "so is one taken at another block size");
+
+    /* A header claiming a record that is not there must find nothing rather
+     * than read past the buffer. */
+    ss_fp_put_header(header, 1);
+    check(ss_fp_store_find(header, sizeof(header), "GALE01", 0, &rec, fp, FP_ENTRIES)
+              != 0,
+          "a truncated store finds nothing");
+
+    /* A record whose block count disagrees with its own card size cannot be
+     * trusted, and cannot be skipped past either -- that count is what says
+     * where the next record starts. */
+    {
+        uint8_t buf[SS_FP_HEADER_SIZE + SS_FP_RECORD_SIZE + 64];
+        ss_fp_record bad;
+
+        memset(buf, 0, sizeof(buf));
+        ss_fp_put_header(buf, 1);
+        fill_record(&bad, "GALE01", 0, 7, 2u * 1024u * 1024u, 0x10);
+        bad.blocks = 4; /* a 2 MiB card is 256 blocks, not 4 */
+        ss_fp_put_record(buf + SS_FP_HEADER_SIZE, &bad);
+        check(ss_fp_store_find(buf, sizeof(buf), "GALE01", 0, &rec, fp, FP_ENTRIES) != 0,
+              "a record whose block count contradicts its size is refused");
+    }
+
+    /* A table larger than the caller's own is refused rather than truncated --
+     * half a table names the wrong chunks just as surely as a stale one. */
+    {
+        ss_fp_record big;
+        uint32_t i;
+
+        remove(FP_STORE);
+        fill_record(&big, "GBIG01", 0, 2, 2u * 1024u * 1024u, 0x22);
+        for (i = 0; i < big.blocks; i++) {
+            fp[i] = i;
+        }
+        check(wii_fp_store_put(FP_STORE, &big, fp) == 0, "a big card stores");
+        {
+            wii_fp_store store;
+            uint32_t small[4];
+
+            wii_fp_store_read(&store, FP_STORE);
+            check(wii_fp_store_get(&store, "GBIG01", 0, &rec, small, 4) != 0,
+                  "and is refused by a reader whose table cannot hold it");
+            wii_fp_store_free(&store);
+        }
+        remove(FP_STORE);
+    }
+}
+
+static void test_fp_runtime_merge(void)
+{
+    static uint32_t fp[FP_ENTRIES];
+    static uint32_t back[FP_ENTRIES];
+    ss_fp_record rec;
+    ss_fp_record got;
+    wii_fp_store store;
+    FILE *probe;
+    uint32_t i;
+
+    printf("fingerprint handoff from the kernel\n");
+
+    remove(FP_STORE);
+    remove(FP_INCOMING);
+
+    /* The launcher's store, as it stood before the game ran. */
+    fill_record(&rec, "GALE01", 0, 7, 2u * 1024u * 1024u, 0x10);
+    for (i = 0; i < rec.blocks; i++) {
+        fp[i] = 0x11110000u + i;
+    }
+    wii_fp_store_put(FP_STORE, &rec, fp);
+
+    /* And another card it tracks, which the kernel knows nothing about. */
+    fill_record(&rec, "GZLE01", 0, 2, 512u * 1024u, 0x30);
+    for (i = 0; i < rec.blocks; i++) {
+        fp[i] = 0x33330000u + i;
+    }
+    wii_fp_store_put(FP_STORE, &rec, fp);
+
+    /* What the kernel left behind: the same card, moved on to v9. */
+    fill_record(&rec, "GALE01", 0, 9, 2u * 1024u * 1024u, 0x77);
+    for (i = 0; i < rec.blocks; i++) {
+        fp[i] = 0x99990000u + i;
+    }
+    wii_fp_store_put(FP_INCOMING, &rec, fp);
+
+    check(wii_fp_merge_runtime(FP_STORE, FP_INCOMING) == 1,
+          "the kernel's handoff merges");
+
+    probe = fopen(FP_INCOMING, "rb");
+    check(probe == NULL, "and the handoff file is removed once taken");
+    if (probe != NULL) {
+        fclose(probe);
+    }
+
+    wii_fp_store_read(&store, FP_STORE);
+    check(wii_fp_store_get(&store, "GALE01", 0, &got, back, FP_ENTRIES) == 0
+              && got.version == 9 && back[0] == 0x99990000u,
+          "the card the kernel pushed now carries the kernel's table");
+    check(wii_fp_store_get(&store, "GZLE01", 0, &got, back, FP_ENTRIES) == 0
+              && got.version == 2 && back[0] == 0x33330000u,
+          "and a card it never saw is untouched");
+    wii_fp_store_free(&store);
+
+    /* No handoff is the normal case, not an error. */
+    check(wii_fp_merge_runtime(FP_STORE, FP_INCOMING) == -1,
+          "a missing handoff says so rather than failing");
+
+    remove(FP_STORE);
+    remove(FP_INCOMING);
+}
+
 /* --- live round trip ---------------------------------------------------- */
 
 /* Build a structurally valid, empty memory card so the server's validation on
@@ -341,6 +614,11 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
     unsigned char *card;
     unsigned char *pulled;
     unsigned char *bitmap;
+    /* A second chunk bitmap and a fingerprint table, for the delta sections:
+     * ss_push_delta rewrites `bitmap` as its own scratch every round, so the
+     * dirty set it is given has to be somewhere else. */
+    unsigned char *bitmap2;
+    uint32_t *dirty_fp;
     size_t card_size = 0;
     uint32_t version = 0;
     uint32_t got_size = 0;
@@ -391,7 +669,10 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
     card = build_card(16, &card_size, 0x42);
     pulled = (unsigned char *)malloc(card_size);
     bitmap = (unsigned char *)malloc(4096);
-    if (card == NULL || pulled == NULL || bitmap == NULL) {
+    bitmap2 = (unsigned char *)malloc(2048);
+    dirty_fp = (uint32_t *)malloc(2048 * sizeof(uint32_t));
+    if (card == NULL || pulled == NULL || bitmap == NULL || bitmap2 == NULL
+        || dirty_fp == NULL) {
         printf("  FAIL  out of memory\n");
         failures++;
         return 1;
@@ -461,10 +742,10 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
         unsigned char *dirty = (unsigned char *)calloc(4096, 1);
         uint32_t chunks = ss_chunk_count((uint32_t)card_size);
         uint32_t first = (uint32_t)((card_size / 2) / SS_MAX_PAYLOAD);
-        uint32_t per_block = 8192u / SS_MAX_PAYLOAD;
         uint32_t delta_version = 0;
         uint32_t ignored = 0;
         unsigned before;
+        int32_t marked;
         uint32_t i;
 
         if (dirty == NULL) {
@@ -473,12 +754,17 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
             return 1;
         }
 
+        /* Seed the table from the bytes the server holds, then make a save
+         * write and let the scan find it -- the same two steps both real
+         * clients take. */
+        memset(dirty_fp, 0, 2048 * sizeof(uint32_t));
+        ss_fp_scan(card, (uint32_t)card_size, dirty_fp, 2048, dirty, 4096);
         for (i = 0; i < 8192u; i++) {
             card[(card_size / 2) + i] ^= 0x5Au;
         }
-        for (i = 0; i < per_block; i++) {
-            ss_bitmap_set(dirty, 4096, 0, first + i);
-        }
+        marked = ss_fp_scan(card, (uint32_t)card_size, dirty_fp, 2048, dirty, 4096);
+        check(marked == 8, "a save write dirties one block, so eight chunks");
+        check(ss_bitmap_test(dirty, 4096, 0, first), "at the right chunk");
 
         before = sock.sent;
         rc = ss_push_delta(&client, game_id, 0, card, (uint32_t)card_size, version, 3,
@@ -555,9 +841,96 @@ static int live_test(const char *host, unsigned short port, const char *psk, int
         free(dirty);
     }
 
+    /* The cross-session case, which is the whole point of the store.
+     *
+     * Everything above delta'd from a table this process built moments earlier.
+     * That is not the situation either real client is in: the launcher is a
+     * fresh process every launch and the kernel starts with empty RAM, so
+     * without a table on disk the first push of every session is a whole card.
+     *
+     * So: store the table, forget it the way a reboot would, read it back, and
+     * delta from that.
+     */
+    {
+        static uint32_t reloaded[2048];
+        ss_fp_record rec;
+        wii_fp_store store;
+        uint8_t committed[SHA256_DIGEST_SIZE];
+        uint32_t chunks = ss_chunk_count((uint32_t)card_size);
+        uint32_t first = (uint32_t)((card_size / 4) / SS_MAX_PAYLOAD);
+        uint32_t delta_version = 0;
+        unsigned before;
+        int32_t marked;
+        uint32_t i;
+
+        /* The digest of the image the server now holds, which the client kept
+         * for us rather than making us hash 2 MiB again. */
+        memcpy(committed, client.last_digest, SHA256_DIGEST_SIZE);
+
+        memset(&rec, 0, sizeof(rec));
+        memcpy(rec.game_id, game_id, SS_GAME_ID_LEN);
+        rec.game_id[SS_GAME_ID_LEN] = '\0';
+        rec.slot = 0;
+        rec.version = version;
+        rec.size = (uint32_t)card_size;
+        rec.blocks = ss_fp_blocks((uint32_t)card_size);
+        memcpy(rec.sha256, committed, SS_FP_DIGEST_SIZE);
+
+        remove(FP_STORE);
+        check(wii_fp_store_put(FP_STORE, &rec, dirty_fp) == 0,
+              "the table stores against the version it describes");
+
+        /* A reboot. Nothing of the table survives in memory. */
+        memset(reloaded, 0, sizeof(reloaded));
+        memset(dirty_fp, 0, 2048 * sizeof(uint32_t));
+
+        wii_fp_store_read(&store, FP_STORE);
+        check(wii_fp_store_get(&store, game_id, 0, &rec, reloaded, 2048) == 0,
+              "and reads back after it");
+        check(wii_fp_usable(&rec, version, (uint32_t)card_size, committed),
+              "and is accepted for the version the server holds");
+        wii_fp_store_free(&store);
+
+        /* Now a save write, and a delta computed entirely from the table that
+         * came off disk. */
+        for (i = 0; i < 8192u; i++) {
+            card[(card_size / 4) + i] ^= 0x3Cu;
+        }
+        marked = ss_fp_scan(card, (uint32_t)card_size, reloaded, 2048, bitmap2,
+                            2048);
+        check(marked == 8, "a reloaded table finds the one changed block");
+        check(ss_bitmap_test(bitmap2, 2048, 0, first), "at the right chunk");
+
+        before = sock.sent;
+        rc = ss_push_delta(&client, game_id, 0, card, (uint32_t)card_size, version, 7,
+                           bitmap2, bitmap, 4096, &delta_version);
+        check(rc == SS_OK, "and pushes as a delta across the reboot");
+        if (rc != SS_OK) {
+            printf("        %s (nack 0x%02x: %s)\n", ss_strerror(rc),
+                   client.last_error_code,
+                   ss_strerror_nack(client.last_error_code));
+        } else {
+            check(sock.sent - before < chunks / 8u,
+                  "sending a small fraction of the card");
+            printf("  across a reboot: %u datagrams for a %u-chunk card, now v%u\n",
+                   sock.sent - before, chunks, delta_version);
+
+            memset(pulled, 0, card_size);
+            rc = ss_pull(&client, game_id, 0, 0, pulled, card_size, bitmap, 4096,
+                         &got_size, &got_version);
+            check(rc == SS_OK, "the result pulls back");
+            check(memcmp(card, pulled, card_size) == 0,
+                  "byte for byte what we hold");
+            version = delta_version;
+        }
+        remove(FP_STORE);
+    }
+
     free(card);
     free(pulled);
     free(bitmap);
+    free(bitmap2);
+    free(dirty_fp);
     host_socket_close(&sock);
     host_socket_cleanup();
     return 0;
@@ -591,6 +964,9 @@ int main(int argc, char **argv)
     test_hmac();
     test_protocol();
     test_bitmaps();
+    test_fp_store();
+    test_fp_store_is_defensive();
+    test_fp_runtime_merge();
 
     if (host != NULL && psk != NULL) {
         live_test(host, port, psk, loss, game_id);

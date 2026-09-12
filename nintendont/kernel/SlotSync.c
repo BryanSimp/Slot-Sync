@@ -15,6 +15,7 @@
 #include "SlotSyncLogic.h"
 
 #include "slotsync/client.h"
+#include "slotsync/fingerprint.h"
 #include "slotsync/protocol.h"
 #include "slotsync/sha256.h"
 
@@ -90,6 +91,22 @@ static void ss_log_flush(void)
 #define SS_STATE_PATH   "/slotsync/state.txt"
 #define SS_HANDOFF_PATH "/slotsync/runtime.txt"
 
+/* Per-block fingerprints, so the first push of a session can be a delta too.
+ *
+ * Two files for the same reason state.txt and runtime.txt are two files: the
+ * launcher's store covers every card it tracks, and this kernel knows about the
+ * one game that just ran. Rewriting the first from here would clobber the other
+ * 63 cards' tables to say something about one. So we read the launcher's and
+ * write our own, and the launcher merges it on the way back -- exactly as it
+ * already does with runtime.txt. */
+#define SS_FP_PATH         "/slotsync/fingerprints.bin"
+#define SS_FP_HANDOFF_PATH "/slotsync/runtime-fp.bin"
+
+/* Staging for the fingerprint file. Big enough for a record header and to move
+ * values a slice at a time, small enough to sit on a 16 KiB stack -- a 16 MiB
+ * card's table is 8 KiB, so it is never read or written in one go. */
+#define SS_FP_SLICE 512
+
 #define SS_CFG_MAX 2048
 
 /* How long SlotSync_Init may wait for DHCP before letting the game boot.
@@ -124,6 +141,10 @@ typedef struct {
 	int halted;      /* a conflict: stop touching this card entirely */
 	int pushed_any;  /* whether `parent` came from us rather than the wrapper */
 	int lineage;     /* we know what version our bytes descend from */
+	/* Digest of the image the server holds as `parent`. From state.txt at
+	 * init, from the push itself after that. It is what says which image a
+	 * fingerprint table describes, so it rides with the table. */
+	u8 parent_sha[SS_FP_DIGEST_SIZE];
 	/* The fingerprint table describes exactly the bytes the server committed
 	 * as `parent`. Only then can a delta be built against it.
 	 *
@@ -253,18 +274,253 @@ static int ss_resolve_game_id(int slot, char out[SS_GAME_ID_LEN + 1])
  * is exactly the silent overwrite this project exists to prevent (PLAN.md 7).
  * So a card with no entry is left alone rather than pushed speculatively.
  */
-static int ss_load_parent(const char *game_id, u8 slot, u32 *out)
+static int ss_load_parent(const char *game_id, u8 slot, u32 *out, u8 *sha)
 {
 	uint32_t version = 0;
 
 	if (ss_read_file(SS_STATE_PATH) < 0) {
 		return -1;
 	}
-	if (ssl_state_find(fileBuf, game_id, slot, &version) != 0) {
+	if (ssl_state_find(fileBuf, game_id, slot, &version, sha) != 0) {
 		return -1;
 	}
 	*out = (u32)version;
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The fingerprint store                                               */
+/* ------------------------------------------------------------------ */
+
+/* Whether a buffer is all zeros. A state file written before digests were
+ * recorded leaves one zeroed, and that has to read as "no digest to check
+ * against" rather than as a digest that happens to be zero. */
+static int ss_all_zero(const u8 *p, u32 len)
+{
+	u32 i;
+
+	for (i = 0; i < len; i++) {
+		if (p[i] != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* One slot's slice of the shared table. */
+static u32 *ss_fp_table(int slot)
+{
+	return fingerprints + (u32)slot * (SS_FP_ENTRIES / SS_SLOTS);
+}
+
+static u32 ss_fp_share(void)
+{
+	return SS_FP_ENTRIES / SS_SLOTS;
+}
+
+/* Read `want` bytes, or fail. FatFs short-reads at end of file rather than
+ * erroring, and a truncated store has to read as "no record" rather than as a
+ * record made of whatever was left in the buffer. */
+static int ss_fp_read(FIL *fd, u8 *buf, u32 want)
+{
+	UINT got = 0;
+
+	if (f_read(fd, buf, (UINT)want, &got) != FR_OK || (u32)got != want) {
+		return -1;
+	}
+	return 0;
+}
+
+/* Read past `bytes` of a record we do not want, a slice at a time. Sequential
+ * reads only: f_lseek would do this in one call, but reading forward needs
+ * nothing from FatFs beyond what the rest of this file already uses. */
+static int ss_fp_skip(FIL *fd, u32 bytes, u8 *buf)
+{
+	while (bytes > 0) {
+		u32 take = bytes < SS_FP_SLICE ? bytes : SS_FP_SLICE;
+
+		if (ss_fp_read(fd, buf, take) != 0) {
+			return -1;
+		}
+		bytes -= take;
+	}
+	return 0;
+}
+
+/* Load one card's fingerprints out of the launcher's store.
+ *
+ * This is what makes the *first* push of a session a delta. Held only in RAM
+ * the table is empty at every boot, so every session opened with a whole card:
+ * 5 s of a 2 MiB card, 41 s of a 16 MiB one, while the game is running.
+ *
+ * Returns 0 when the table now describes the image the server holds as
+ * `parent`, and -1 otherwise -- no file, no record, or a record for some other
+ * version, size or image. Every one of those is a reason to push whole, not a
+ * reason to complain.
+ */
+static int ss_load_fingerprints(int slot, const char *game_id, u32 parent, u32 size,
+				const u8 *parent_sha)
+{
+	FIL fd;
+	u8 buf[SS_FP_SLICE];
+	u32 *table = ss_fp_table(slot);
+	int records;
+	int i;
+	int found = -1;
+
+	if (parent == 0 || size == 0) {
+		return -1; /* nothing to descend from */
+	}
+	if (f_open_char(&fd, SS_FP_PATH, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+		return -1; /* no store yet is the normal first run */
+	}
+	if (ss_fp_read(&fd, buf, SS_FP_HEADER_SIZE) != 0) {
+		f_close(&fd);
+		return -1;
+	}
+	records = ss_fp_store_count(buf, SS_FP_HEADER_SIZE);
+	if (records < 0) {
+		f_close(&fd);
+		sslog("SlotSync: %s is not a fingerprint store\r\n", SS_FP_PATH);
+		return -1;
+	}
+
+	for (i = 0; i < records && found != 0; i++) {
+		ss_fp_record rec;
+		u32 values;
+
+		if (ss_fp_read(&fd, buf, SS_FP_RECORD_SIZE) != 0) {
+			break;
+		}
+		/* A self-inconsistent record cannot be skipped past either: its
+		 * block count is what says where the next one starts. */
+		if (ss_fp_get_record(&rec, buf) != 0) {
+			break;
+		}
+		values = rec.blocks * 4u;
+
+		if (rec.slot != (u8)slot
+		    || memcmp(rec.game_id, game_id, SS_GAME_ID_LEN) != 0) {
+			if (ss_fp_skip(&fd, values, buf) != 0) {
+				break;
+			}
+			continue;
+		}
+
+		/* Ours. Every one of these has to hold, because a table that
+		 * describes any image but the server's `parent` names the wrong
+		 * chunks. Being wrong costs a round rather than a card -- the
+		 * PUSH_END digest refuses it -- but a round mid-game is the
+		 * thing this whole change exists to avoid. */
+		if (rec.version != parent || rec.size != size
+		    || rec.blocks > ss_fp_share()) {
+			break;
+		}
+		/* The digest is the strongest of the checks: it says the record
+		 * was taken from the same bytes state.txt calls this version.
+		 * A state file written before digests were recorded leaves it
+		 * zeroed, and then the version and size have to carry it. */
+		if (!ss_all_zero(parent_sha, SS_FP_DIGEST_SIZE)
+		    && memcmp(rec.sha256, parent_sha, SS_FP_DIGEST_SIZE) != 0) {
+			sslog("SlotSync: %s fingerprints are for other bytes at "
+			      "v%u; pushing whole\r\n", game_id, (u32)parent);
+			break;
+		}
+
+		{
+			u32 left = rec.blocks;
+			u32 at = 0;
+
+			while (left > 0) {
+				u32 take = left < (SS_FP_SLICE / 4u) ? left
+								    : (SS_FP_SLICE / 4u);
+
+				if (ss_fp_read(&fd, buf, take * 4u) != 0) {
+					break;
+				}
+				ss_fp_get_values(table + at, buf, take);
+				at += take;
+				left -= take;
+			}
+			found = left == 0 ? 0 : -1;
+		}
+	}
+
+	f_close(&fd);
+	return found;
+}
+
+/* Hand our tables to the launcher, so its next push is a delta as well.
+ *
+ * Only slots that pushed *and* whose table is confirmed: a table written after
+ * a push the server did not accept describes bytes nobody holds, and would cost
+ * the launcher the wasted round we just saved it.
+ */
+static void ss_write_fp_handoff(void)
+{
+	FIL fd;
+	UINT wrote;
+	u8 buf[SS_FP_SLICE];
+	int i;
+	int cards = 0;
+
+	for (i = 0; i < SS_SLOTS; i++) {
+		if (slots[i].pushed_any && slots[i].fp_valid) {
+			cards++;
+		}
+	}
+	if (cards == 0) {
+		return;
+	}
+
+	if (f_open_char(&fd, SS_FP_HANDOFF_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+		sslog("SlotSync: cannot write %s\r\n", SS_FP_HANDOFF_PATH);
+		return;
+	}
+
+	ss_fp_put_header(buf, (u16)cards);
+	f_write(&fd, buf, SS_FP_HEADER_SIZE, &wrote);
+
+	for (i = 0; i < SS_SLOTS; i++) {
+		ss_slot *s = &slots[i];
+		ss_fp_record rec;
+		const u32 *table;
+		u32 size;
+		u32 left;
+		u32 at = 0;
+
+		if (!s->pushed_any || !s->fp_valid) {
+			continue;
+		}
+		size = GCNCard_GetSize(i);
+		if (size == 0) {
+			continue;
+		}
+
+		memcpy(rec.game_id, s->game_id, SS_GAME_ID_LEN + 1);
+		rec.slot = (u8)i;
+		rec.version = s->parent;
+		rec.size = size;
+		rec.blocks = ss_fp_blocks(size);
+		memcpy(rec.sha256, s->parent_sha, SS_FP_DIGEST_SIZE);
+
+		ss_fp_put_record(buf, &rec);
+		f_write(&fd, buf, SS_FP_RECORD_SIZE, &wrote);
+
+		table = ss_fp_table(i);
+		left = rec.blocks;
+		while (left > 0) {
+			u32 take = left < (SS_FP_SLICE / 4u) ? left : (SS_FP_SLICE / 4u);
+
+			ss_fp_put_values(buf, table + at, take);
+			f_write(&fd, buf, (UINT)(take * 4u), &wrote);
+			at += take;
+			left -= take;
+		}
+		sslog("SlotSync: handed %s v%u's fingerprints to the launcher\r\n",
+		      s->game_id, (u32)s->parent);
+	}
+	f_close(&fd);
 }
 
 /* Hand the versions we reached back to the libogc wrapper.
@@ -367,13 +623,12 @@ static void ss_push_slot(int slot)
 	 * push of a session and after any push that did not land, so the first
 	 * push of a card always goes whole. */
 	{
-		u32 share = SS_FP_ENTRIES / SS_SLOTS;
-		int32_t marked = ssl_delta_scan(image, size,
-						fingerprints + (u32)slot * share,
-						share, dirtyMap, (u32)sizeof(dirtyMap));
+		int32_t marked = ss_fp_scan(image, size, ss_fp_table(slot),
+					    ss_fp_share(), dirtyMap,
+					    (u32)sizeof(dirtyMap));
 
 		useDelta = s->fp_valid && marked >= 0
-			   && ssl_delta_worthwhile((u32)marked, ss_chunk_count(size));
+			   && ss_fp_worthwhile((u32)marked, ss_chunk_count(size));
 
 		/* Not valid again until this push is confirmed: the scan above
 		 * has already moved the table on to bytes the server has not
@@ -468,8 +723,10 @@ static void ss_push_slot(int slot)
 		s->pushed_any = 1;
 		s->pushed_at = read32(HW_TIMER);
 		/* Confirmed, so the table now describes what the server holds
-		 * and the next push can be a delta against it. */
+		 * and the next push can be a delta against it -- this session's
+		 * and, once the handoff is written, the launcher's. */
 		s->fp_valid = 1;
+		memcpy(s->parent_sha, client.last_digest, SS_FP_DIGEST_SIZE);
 		sslog("SlotSync: %s is now v%u (%u sends refused)\r\n",
 		      s->game_id, (u32)assigned, net.dropped);
 		/* Do NOT write the handoff here.
@@ -750,10 +1007,25 @@ int SlotSync_Init(void)
 			continue;
 		}
 
-		if (ss_load_parent(s->game_id, (u8)slot, &s->parent) == 0) {
+		if (ss_load_parent(s->game_id, (u8)slot, &s->parent,
+				   s->parent_sha) == 0) {
 			s->lineage = 1;
 			sslog("SlotSync: slot %c is %s at v%u\r\n", slot + 'A',
 			      s->game_id, s->parent);
+
+			/* The launcher's fingerprints for that exact version,
+			 * if it left any. This is what makes the *first* push
+			 * of the session a delta rather than a whole card --
+			 * 5 s of a 2 MiB card, 41 s of a 16 MiB one, paid once
+			 * per session for no reason other than the table
+			 * starting empty. */
+			if (ss_load_fingerprints(slot, s->game_id, s->parent,
+						 GCNCard_GetSize(slot),
+						 s->parent_sha) == 0) {
+				s->fp_valid = 1;
+				sslog("SlotSync: slot %c can delta from v%u "
+				      "straight away\r\n", slot + 'A', s->parent);
+			}
 		} else {
 			/* No entry in the launcher's state file. We cannot name a
 			 * parent yet, and guessing one risks overwriting a version
@@ -868,6 +1140,7 @@ void SlotSync_Poll(void)
 	if (handoffPending) {
 		handoffPending = 0;
 		ss_write_handoff();
+		ss_write_fp_handoff();
 	}
 	ss_log_flush();
 }
@@ -896,6 +1169,7 @@ void SlotSync_NotifyCardSaved(int slot)
 	if (handoffPending) {
 		handoffPending = 0;
 		ss_write_handoff();
+		ss_write_fp_handoff();
 	}
 	ss_log_flush();
 }
@@ -928,6 +1202,7 @@ void SlotSync_Shutdown(void)
 	if (handoffPending) {
 		handoffPending = 0;
 		ss_write_handoff();
+		ss_write_fp_handoff();
 	}
 	ss_log_flush();
 }

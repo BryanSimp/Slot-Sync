@@ -33,6 +33,7 @@
 #include "wii_config.h"
 #include "wii_drc.h"
 #include "wii_dol.h"
+#include "wii_fingerprint.h"
 #include "wii_net.h"
 #include "wii_saves.h"
 
@@ -42,6 +43,8 @@
  * get a failure three games in. */
 #define CARD_BUFFER_BYTES (16 * 1024 * 1024)
 #define BITMAP_BYTES 2048 /* 16384 chunks / 8 */
+/* One fingerprint per 8 KiB block, enough for the largest card. */
+#define FP_ENTRIES (CARD_BUFFER_BYTES / (int)SS_FP_BLOCK_SIZE)
 
 static void video_init(void)
 {
@@ -209,6 +212,50 @@ static int digests_match(const uint8_t *a, const uint8_t *b)
     return slotsync_memequal(a, b, SHA256_DIGEST_SIZE);
 }
 
+/* Record the fingerprints of a card we have just agreed with the server.
+ *
+ * `current` says whether `fp` already describes `card`, which it does after a
+ * delta push -- ss_fp_scan leaves it that way. Otherwise it is stale or was
+ * never filled, so it is zeroed and rebuilt; the bitmap that falls out is
+ * discarded, only the table matters.
+ *
+ * `version` and `digest` are what bind the table to one image. A table stored
+ * against the wrong pair is the only way this can name the wrong chunks later,
+ * and the PUSH_END digest is what catches that -- at the cost of a round, which
+ * is the thing worth not spending.
+ */
+static void save_fingerprints(const char *game_id, const uint8_t *card, uint32_t size,
+                              uint32_t version, const uint8_t *digest, uint32_t *fp,
+                              uint8_t *dirty, int current)
+{
+    ss_fp_record rec;
+
+    if (size == 0 || version == 0) {
+        return;
+    }
+    if (!current) {
+        memset(fp, 0, FP_ENTRIES * sizeof(uint32_t));
+        if (ss_fp_scan(card, size, fp, FP_ENTRIES, dirty, BITMAP_BYTES) < 0) {
+            return; /* a card this build cannot table; it goes whole */
+        }
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    memcpy(rec.game_id, game_id, WII_GAME_ID_LEN);
+    rec.game_id[WII_GAME_ID_LEN] = '\0';
+    rec.slot = 0;
+    rec.version = version;
+    rec.size = size;
+    rec.blocks = ss_fp_blocks(size);
+    memcpy(rec.sha256, digest, SS_FP_DIGEST_SIZE);
+
+    if (wii_fp_store_put(WII_FP_PATH, &rec, fp) != 0) {
+        /* Not worth failing the sync over: the card is safely on the server,
+         * and all a missing table costs is the next push going whole. */
+        printf("  %s: could not record fingerprints\n", game_id);
+    }
+}
+
 /* One card, both directions. Returns 0 if nothing went wrong; a conflict counts
  * as "went wrong" only in the sense that it is reported and skipped -- it is
  * never resolved here. PLAN.md section 7: a human chooses, in the web UI. */
@@ -217,7 +264,8 @@ static int digests_match(const uint8_t *a, const uint8_t *b)
  * same string and must not be used interchangeably: the file lives under the
  * stem, every protocol call takes the id. */
 static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
-                    const char *stem, uint8_t *card, uint8_t *bitmap)
+                    const char *stem, uint8_t *card, uint8_t *bitmap, uint32_t *fp,
+                    uint8_t *dirty)
 {
     char game_id[WII_GAME_ID_LEN + 1];
     wii_card_state *entry;
@@ -226,6 +274,9 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
     uint32_t server_size = 0;
     long size;
     int rc;
+    /* Set once the fingerprint table describes the version we are pushing
+     * against, which is the only state in which it can name the right chunks. */
+    int fp_ready = 0;
 
     size = wii_saves_read(cfg->saves_dir, stem, card, CARD_BUFFER_BYTES);
     if (size <= 0) {
@@ -265,10 +316,42 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
 
         if (!entry->known || !digests_match(digest, entry->sha256)) {
             uint32_t assigned = 0;
+            int32_t marked = -1;
 
-            printf("  %s: pushing %ld KiB...\n", game_id, size / 1024);
-            rc = ss_push(client, game_id, 0, card, (uint32_t)size, entry->version,
-                         entry->version + 1, bitmap, BITMAP_BYTES, &assigned);
+            /* What changed since the version the server holds.
+             *
+             * The table has to describe that exact image, so it is only taken
+             * from the store when the record's version, size and digest all
+             * agree with what state.txt says we last agreed. Anything short of
+             * that and the card goes whole -- which is what every push did
+             * before the store existed. */
+            if (entry->known) {
+                wii_fp_store store;
+                ss_fp_record rec;
+
+                wii_fp_store_read(&store, WII_FP_PATH);
+                if (wii_fp_store_get(&store, game_id, 0, &rec, fp, FP_ENTRIES) == 0
+                    && wii_fp_usable(&rec, entry->version, (uint32_t)size,
+                                     entry->sha256)) {
+                    marked = ss_fp_scan(card, (uint32_t)size, fp, FP_ENTRIES, dirty,
+                                        BITMAP_BYTES);
+                    fp_ready = marked >= 0
+                               && ss_fp_worthwhile((uint32_t)marked,
+                                                   ss_chunk_count((uint32_t)size));
+                }
+                wii_fp_store_free(&store);
+            }
+
+            if (fp_ready) {
+                printf("  %s: pushing %ld of %lu chunks...\n", game_id, (long)marked,
+                       (unsigned long)ss_chunk_count((uint32_t)size));
+            } else {
+                printf("  %s: pushing %ld KiB...\n", game_id, size / 1024);
+            }
+            rc = ss_push_delta(client, game_id, 0, card, (uint32_t)size,
+                               entry->version, entry->version + 1,
+                               fp_ready ? dirty : NULL, bitmap, BITMAP_BYTES,
+                               &assigned);
 
             if (rc == SS_ERR_CONFLICT) {
                 /* Someone else moved this card on while we were playing.
@@ -310,6 +393,11 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
                 memcpy(entry->sha256, digest, SHA256_DIGEST_SIZE);
                 server_version = assigned;
                 printf("  %s: pushed as v%u\n", game_id, assigned);
+                /* The table now describes what the server holds, so record it
+                 * against the version it just assigned -- that is what lets
+                 * the next push, here or in the kernel, be a delta. */
+                save_fingerprints(game_id, card, (uint32_t)size, assigned, digest,
+                                  fp, dirty, fp_ready);
             }
         }
     }
@@ -336,6 +424,10 @@ static int sync_one(ss_client *client, const wii_config *cfg, wii_state *state,
         entry->known = 1;
         memcpy(entry->sha256, digest, SHA256_DIGEST_SIZE);
         printf("  %s: pulled v%u\n", game_id, got_version);
+        /* A pull agrees with the server just as firmly as a push does, and it
+         * is the case where a table is most likely to be missing -- a card that
+         * arrived from the PC side has never been fingerprinted here. */
+        save_fingerprints(game_id, card, got_size, got_version, digest, fp, dirty, 0);
     } else if (size > 0 && entry->known) {
         printf("  %s: up to date (v%u)\n", game_id, entry->version);
     }
@@ -348,6 +440,8 @@ static void sync_all(ss_client *client, const wii_config *cfg, wii_state *state)
     static char games[WII_MAX_CARDS][WII_GAME_ID_LEN + 1];
     uint8_t *card;
     uint8_t *bitmap;
+    uint32_t *fp;
+    uint8_t *dirty;
     int found;
     int i;
 
@@ -363,21 +457,30 @@ static void sync_all(ss_client *client, const wii_config *cfg, wii_state *state)
 
     card = (uint8_t *)malloc(CARD_BUFFER_BYTES);
     bitmap = (uint8_t *)malloc(BITMAP_BYTES);
-    if (card == NULL || bitmap == NULL) {
+    /* The fingerprint table and the chunk bitmap a delta push needs. Separate
+     * from `bitmap`, which ss_push_delta rewrites every round as its own
+     * scratch. 8 KiB and 2 KiB against a 16 MiB card buffer. */
+    fp = (uint32_t *)malloc(FP_ENTRIES * sizeof(uint32_t));
+    dirty = (uint8_t *)malloc(BITMAP_BYTES);
+    if (card == NULL || bitmap == NULL || fp == NULL || dirty == NULL) {
         printf("not enough memory for a card buffer\n");
         free(card);
         free(bitmap);
+        free(fp);
+        free(dirty);
         return;
     }
 
     printf("syncing %d card(s)\n", found);
     for (i = 0; i < found; i++) {
-        sync_one(client, cfg, state, games[i], card, bitmap);
+        sync_one(client, cfg, state, games[i], card, bitmap, fp, dirty);
         wii_state_save(state, WII_STATE_PATH);
     }
 
     free(card);
     free(bitmap);
+    free(fp);
+    free(dirty);
 }
 
 int main(int argc, char **argv)
@@ -498,6 +601,10 @@ int main(int argc, char **argv)
                    merged);
             wii_state_save(&state, WII_STATE_PATH);
         }
+        /* And the fingerprint tables it left, so the first push below is a
+         * delta rather than a whole card. Independent of the versions above:
+         * a table is useful even for a card whose version did not move. */
+        wii_fp_merge_runtime(WII_FP_PATH, WII_FP_RUNTIME_PATH);
     }
     sync_all(&client, &cfg, &state);
     wii_net_close(&sock);

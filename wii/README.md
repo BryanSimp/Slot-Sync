@@ -82,7 +82,8 @@ resolver.
 ## What it does at launch
 
 1. Push every `GAMEID.raw` in `/saves` that differs from what it last agreed
-   with the server.
+   with the server — sending only the blocks that changed, where it can. See
+   **Delta push** below.
 2. Pull every card the server has moved ahead on.
 3. Chainload Nintendont.
 4. If control ever comes back, do 1 and 2 again.
@@ -118,9 +119,47 @@ every header offset against `docs/PROTOCOL.md`. The live half pushes a 2 MiB
 card, pulls it back, compares it byte for byte, and confirms a stale parent is
 refused — with packet loss injectable in both directions.
 
+## Delta push
+
+A push sends only the 8 KiB blocks that changed since the version the server
+holds — typically 2–5% of a card, because a save write touches its own blocks
+plus one directory block and one BAT block. `docs/PROTOCOL.md` has the wire
+format; `PLAN.md` §5 has why a byte-level splice is safe here when the rule says
+never to merge two cards.
+
+What makes it possible across launches is that the fingerprints live on the SD
+card. This is a fresh process every launch, so a table held only in RAM would be
+empty every time and every push would be whole.
+
+**The store is shared with Nintendont's in-kernel sync.** Both sides push to one
+card's lineage, so a table written by either is the one the other wants next:
+
+| File | Written by | Read by |
+|---|---|---|
+| `sd:/slotsync/fingerprints.bin` | this launcher | both |
+| `sd:/slotsync/runtime-fp.bin` | the in-kernel sync, at game exit | this launcher, which merges and removes it |
+
+Two files rather than one for the same reason `state.txt` and `runtime.txt` are
+two: this launcher's store covers every card it tracks, and the kernel knows
+only about the game that just ran. Letting the kernel rewrite the shared file
+would clobber the other 63 cards' tables to say something about one.
+
+A table is only used when its record's **version, card size and digest** all
+match what `state.txt` says was last agreed. Anything less and the card goes
+whole. Getting that wrong is not corruption — `PUSH_END` carries the digest of
+the whole card, so a delta built on a stale table is refused and the client
+resends everything — but it costs a round, which is the thing worth not
+spending.
+
+Delete `fingerprints.bin` and nothing breaks; the next push of each card is
+whole and rebuilds it.
+
 ## State
 
 `sd:/slotsync/state.txt` records, per card, the version and digest last agreed
 with the server. That is what lets a push name its parent, which is the whole
 basis of the conflict model. Delete it and every card looks new, which will
 produce conflicts rather than data loss.
+
+The digest has a second job now: it is what a fingerprint record is checked
+against before its table may be trusted to describe that version.
