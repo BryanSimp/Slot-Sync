@@ -351,6 +351,99 @@ def test_push_end_without_a_staging_buffer_is_nacked(server):
     assert drain(server)[0].payload[0] == Error.STAGING_EXPIRED
 
 
+# --- a resent PUSH_END ----------------------------------------------------
+#
+# PUSH_END's reply is the one datagram nobody retransmits on a timer, so losing
+# it is the failure a UDP push is most exposed to. Observed on hardware
+# 2026-09-12: a committed v38 came back as STAGING_EXPIRED, the console recorded
+# the push as failed, kept its old parent, and had its next save refused as a
+# conflict against the version it had itself just written.
+
+
+def test_a_resent_push_end_is_acked_again_rather_than_expired(server):
+    begin, chunks, end = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+
+    run(server._dispatch(end, PEER))
+    first = drain(server)[0]
+    run(server._dispatch(end, PEER))
+    again = drain(server)[0]
+
+    assert first.msg_type == MsgType.ACK
+    assert again.msg_type == MsgType.ACK
+    assert again.card_version == first.card_version
+
+
+def test_a_resent_push_end_does_not_commit_a_second_version(server):
+    _, _, end = push_messages(CARD)
+    run(do_push(server, CARD))
+
+    run(server._dispatch(end, PEER))
+    run(server._dispatch(end, PEER))
+
+    assert len(server.store.history("GALE01", 0)) == 1
+
+
+def test_a_resent_push_end_replays_a_checksum_failure(server):
+    """The failures have to replay too.
+
+    A client told CHECKSUM_MISMATCH resends the whole card; one told 0x0b
+    instead concludes the push failed and waits for the next save. Replaying the
+    real verdict is what keeps that fallback reachable.
+    """
+    begin, chunks, end = push_messages(CARD)
+    run(server._dispatch(begin, PEER))
+    for chunk in chunks:
+        server.datagram_received(pack(chunk, TEST_PSK), PEER)
+    drain(server)
+    liar = dataclasses.replace(end, payload=hashlib.sha256(b"not this").digest())
+
+    run(server._dispatch(liar, PEER))
+    assert drain(server)[0].payload[0] == Error.CHECKSUM_MISMATCH
+    run(server._dispatch(liar, PEER))
+    assert drain(server)[0].payload[0] == Error.CHECKSUM_MISMATCH
+
+
+def test_a_resent_push_end_replays_a_conflict_and_its_head(server):
+    run(do_push(server, CARD))
+    run(do_push(server, make_card("Something Else"), parent=1, tid=2))
+    _, _, end = push_messages(make_card("Third"), parent=1, tid=3)
+
+    run(do_push(server, make_card("Third"), parent=1, tid=3))
+    run(server._dispatch(end, PEER))
+    again = drain(server)[0]
+
+    assert again.msg_type == MsgType.NACK
+    assert again.payload[0] == Error.CONFLICT
+    # The head still rides along, so a client that lost the first reply can
+    # still tell a human which version it is up against.
+    assert again.card_version == 2
+
+
+def test_a_new_push_begin_forgets_the_previous_verdict(server):
+    """Reusing a transfer id starts a new transfer, not a second look at the old
+    one -- so the remembered reply must not answer for it."""
+    run(do_push(server, CARD))
+    assert server.settled
+
+    run(server._dispatch(*_begin(CARD, tid=1)))
+    assert server.settled == {}
+
+
+def test_a_remembered_reply_expires_on_the_sweep(server):
+    run(do_push(server, CARD))
+    assert len(server.settled) == 1
+
+    settled = next(iter(server.settled.values()))
+    server.sweep(now=settled.at + 1)
+    assert len(server.settled) == 1
+    server.sweep(now=settled.at + 121)
+    assert server.settled == {}
+
+
 def test_concurrent_staging_buffers_are_capped(config):
     small = dataclasses.replace(config, max_staging=2)
     server = SlotSyncProtocol(small, Store(small))

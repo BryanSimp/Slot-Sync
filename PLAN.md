@@ -590,6 +590,32 @@ it would only help the libogc launcher. `docs/PROTOCOL.md` records where it woul
 new message type is needed, because `PULL_REQ` already carries a bitmap of wanted chunks
 and its `parent_version` field is unused.
 
+**M13 — A repeated `PUSH_END` gets the same answer**
+Found by running M11 and M12 on a console, which they had never been. Both worked. What
+did not was the *last datagram*: `PUSH_END`'s reply is the one nobody retransmits on a
+timer, and the server dropped the staging buffer the moment it committed, so a client that
+missed the reply and asked again was told `STAGING_EXPIRED`. A push that had committed as
+v38 read to the console as a push that failed — so it kept its old parent, pushed again on
+the next save, and was refused as a conflict against the version it had itself just
+written. Nothing was lost and nothing was overwritten: the card halted and the save waited
+on the SD card, which is §7 working correctly on a false premise.
+
+`0x0B` was doing two jobs — "your transfer expired" and "your transfer succeeded and you
+missed the receipt" — and a client cannot tell those apart. So the server now keeps the
+*reply* after it drops the buffer, keyed the same way and for the same 120 s, and replays
+it verbatim. A transfer is decided once; asking twice does not re-decide it.
+
+This belongs in the server, not in either client. The launcher had no recovery for it at
+all, and the kernel's needed one more round trip to survive immediately after a round trip
+had not — on hardware, it did not. Keeping the decision costs tens of bytes against a
+staging buffer's megabytes, and it asks nothing new of a client that cannot afford it
+(§2): the fix is that the answer a client already knows how to read arrives more than
+once.
+
+*Done when:* a push whose `PUSH_END` reply is thrown away commits exactly one version and
+reports it. **Done** — `fake_console.py push --lose-end-reply` reproduces the failure
+against an unfixed server and gets the replayed ACK from a fixed one.
+
 ### Open question that gates M7
 
 PLAN §13's first open question — whether Nintendont returns control to the launching

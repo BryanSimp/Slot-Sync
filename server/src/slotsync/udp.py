@@ -155,6 +155,34 @@ class Staging:
         ]
 
 
+@dataclass
+class Settled:
+    """The reply a finished transfer earned, kept so it can be given again.
+
+    PUSH_END is the last datagram of a push, which makes its reply the one
+    datagram nobody retransmits on a timer -- if it is lost, the client asks
+    again and the staging buffer it is asking about is already gone. Deleting
+    that buffer promptly is right: it holds a whole card. Forgetting what it
+    *decided* is not.
+
+    Without this the server answers STAGING_EXPIRED to the second PUSH_END, and
+    a push that committed reads to the client as a push that failed -- observed
+    on hardware 2026-09-12, where a committed v38 came back as `nack 0x0b`, the
+    console kept its old parent, and its next save was refused as a conflict
+    against a version it had itself just written.
+
+    So the outcome outlives the buffer: ACK with the committed version, or the
+    same NACK, replayed verbatim for as long as the client could still be
+    asking. Only the reply is kept -- tens of bytes against a staging buffer's
+    megabytes -- so this is cheap to hold for every push in flight.
+    """
+
+    msg_type: int
+    card_version: int
+    payload: bytes
+    at: float = field(default_factory=time.monotonic)
+
+
 class SlotSyncProtocol(asyncio.DatagramProtocol):
     """Server side of the binary protocol."""
 
@@ -164,6 +192,10 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         self.key = config.psk
         self.transport: asyncio.DatagramTransport | None = None
         self.staging: dict[tuple, Staging] = {}
+        #: Outcomes of transfers that have finished, so a resent PUSH_END is
+        #: answered the way the first one was. Swept on the same timer as
+        #: `staging`; see `Settled`.
+        self.settled: dict[tuple, Settled] = {}
         self._tasks: set[asyncio.Task] = set()
         self._sweeper: asyncio.Task | None = None
 
@@ -410,6 +442,12 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         # and keeping half-filled bytes from a previous attempt is how you get a
         # card that passes its checksum and is still wrong. The delta
         # declaration is discarded with them, for the same reason.
+        #
+        # A remembered reply goes too. A client that has reached PUSH_END
+        # retransmits *that*, never PUSH_BEGIN, so a PUSH_BEGIN arriving after a
+        # transfer settled is a new attempt that happens to reuse the id -- and
+        # answering it later with the previous attempt's verdict would be a lie.
+        self.settled.pop(key, None)
         self.staging[key] = Staging(
             total_size=message.total_size,
             parent_version=message.parent_version,
@@ -519,6 +557,32 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
         key = _key(message)
         staging = self.staging.get(key)
         if staging is None:
+            # Already decided, and the client is asking again because our reply
+            # did not arrive. Give the same answer: the decision was made once,
+            # against bytes we have since dropped, and re-deciding is not on the
+            # table. See `Settled`.
+            settled = self.settled.get(key)
+            if settled is not None:
+                log.info(
+                    "replaying the reply to a resent PUSH_END",
+                    extra={
+                        "peer": _peer(addr),
+                        "game_id": message.game_id,
+                        "slot": message.slot,
+                        "acked": settled.msg_type == MsgType.ACK,
+                        "version": settled.card_version,
+                    },
+                )
+                self._send(
+                    reply_to(
+                        message,
+                        settled.msg_type,
+                        card_version=settled.card_version,
+                        payload=settled.payload,
+                    ),
+                    addr,
+                )
+                return
             self._nack(message, addr, Error.STAGING_EXPIRED)
             return
 
@@ -548,8 +612,7 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
                 "push failed its digest",
                 extra={"peer": _peer(addr), "game_id": staging.game_id},
             )
-            del self.staging[key]
-            self._nack(message, addr, Error.CHECKSUM_MISMATCH)
+            self._settle(message, addr, key, Error.CHECKSUM_MISMATCH)
             return
 
         try:
@@ -572,26 +635,54 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
                     "head": exc.head_version,
                 },
             )
-            del self.staging[key]
             # card_version carries the head, so the client can pull it and let
             # a human choose rather than guessing.
-            self._nack(message, addr, Error.CONFLICT, card_version=exc.head_version)
+            self._settle(
+                message, addr, key, Error.CONFLICT, card_version=exc.head_version
+            )
             return
         except TooLargeError:
-            del self.staging[key]
-            self._nack(message, addr, Error.TOO_LARGE)
+            self._settle(message, addr, key, Error.TOO_LARGE)
             return
         except ValidationError as exc:
             log.warning(
                 "udp push failed validation",
                 extra={"peer": _peer(addr), "detail": str(exc)},
             )
-            del self.staging[key]
-            self._nack(message, addr, Error.FAILED_VALIDATION)
+            self._settle(message, addr, key, Error.FAILED_VALIDATION)
             return
 
-        del self.staging[key]
-        self._send(reply_to(message, MsgType.ACK, card_version=result.version), addr)
+        self._settle(message, addr, key, None, card_version=result.version)
+
+    def _settle(
+        self,
+        message: Message,
+        addr,
+        key: tuple,
+        code: Error | None,
+        *,
+        card_version: int = 0,
+    ) -> None:
+        """Finish a transfer: drop its buffer, remember the reply, send it.
+
+        `code` None is an ACK; anything else is that NACK. Every terminal answer
+        to PUSH_END goes through here, so the retransmission of any of them --
+        not just the successful one -- gets the answer it earned rather than
+        STAGING_EXPIRED. That matters for the failures too: a client told
+        CHECKSUM_MISMATCH resends the whole card, and a client told 0x0b instead
+        does not.
+        """
+        msg_type = MsgType.ACK if code is None else MsgType.NACK
+        payload = b"" if code is None else bytes([code])
+
+        self.staging.pop(key, None)
+        self.settled[key] = Settled(
+            msg_type=msg_type, card_version=card_version, payload=payload
+        )
+        self._send(
+            reply_to(message, msg_type, card_version=card_version, payload=payload),
+            addr,
+        )
 
     async def _on_pull_req(self, message: Message, addr) -> None:
         """Send a card back, chunked and paced.
@@ -734,6 +825,18 @@ class SlotSyncProtocol(asyncio.DatagramProtocol):
                     "expected": staging.expected,
                 },
             )
+
+        # Remembered replies go on the same timer, and for the same reason it
+        # was chosen: a transfer cannot outlive the staging TTL, so a client
+        # still retransmitting PUSH_END after one has given up anyway. They are
+        # tens of bytes each, so this is about tidiness rather than memory.
+        for key in [
+            key
+            for key, settled in self.settled.items()
+            if now - settled.at > self.config.staging_ttl
+        ]:
+            del self.settled[key]
+
         return len(dead)
 
 
