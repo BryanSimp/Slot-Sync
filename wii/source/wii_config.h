@@ -17,6 +17,13 @@
  * removed. */
 #define WII_RUNTIME_PATH "sd:/slotsync/runtime.txt"
 
+/* Per-block fingerprints, so a push can send only the blocks that changed --
+ * core/fingerprint.h. The store is shared with Nintendont's in-kernel sync,
+ * which reads it at boot and writes its own tables back through the second
+ * file, exactly as it does with state.txt and runtime.txt above. */
+#define WII_FP_PATH "sd:/slotsync/fingerprints.bin"
+#define WII_FP_RUNTIME_PATH "sd:/slotsync/runtime-fp.bin"
+
 #define WII_MAX_STR 128
 
 typedef struct {
