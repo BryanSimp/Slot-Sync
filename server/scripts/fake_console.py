@@ -281,6 +281,7 @@ def do_push(
     rounds: int,
     pace: float,
     delta_from: Path | None = None,
+    lose_end_reply: bool = False,
 ) -> int:
     image = path.read_bytes()
     total = len(image)
@@ -379,6 +380,32 @@ def do_push(
             build(link.key, PUSH_END, total_size=total, payload=digest, **head(PUSH_END)),
             lossy=False,
         )
+
+        if lose_end_reply:
+            # The failure this flag exists to reproduce: the server decided, and
+            # its reply did not arrive. Throw the first one away and ask again,
+            # which is exactly what a console does when the last datagram of a
+            # push goes missing -- and the last datagram is the one with nobody
+            # retransmitting it on a timer.
+            #
+            # A server that remembers its verdict answers the same way twice. One
+            # that does not says STAGING_EXPIRED, and a push that committed reads
+            # as a push that failed.
+            lost = link.recv(lossy=False)
+            if lost is None:
+                raise ProtocolError("timed out waiting for the PUSH_END reply")
+            if lost["msg_type"] == ACK:
+                kind = f"ACK v{lost['card_version']}"
+            else:
+                kind = f"NACK 0x{lost['payload'][0]:02x}" if lost["payload"] else "NACK"
+            print(f"  dropping the first PUSH_END reply ({kind}) and asking again")
+            lose_end_reply = False
+            link.send(
+                build(
+                    link.key, PUSH_END, total_size=total, payload=digest, **head(PUSH_END)
+                ),
+                lossy=False,
+            )
 
         reply = link.recv(lossy=False)
         if reply is None:
@@ -532,6 +559,15 @@ def main(argv: list[str] | None = None) -> int:
             "the bytes of --parent as the server holds them"
         ),
     )
+    push.add_argument(
+        "--lose-end-reply",
+        action="store_true",
+        help=(
+            "throw away the first reply to PUSH_END and ask again, as a console "
+            "does when the last datagram of a push is lost; the server should "
+            "give the same answer rather than STAGING_EXPIRED"
+        ),
+    )
 
     pull = sub.add_parser("pull")
     pull.add_argument("game_id")
@@ -571,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.rounds,
                 args.pace,
                 args.delta_from,
+                args.lose_end_reply,
             )
         return do_pull(
             link, args.device, args.game_id, slot, args.path, args.version, args.rounds

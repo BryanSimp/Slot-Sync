@@ -703,14 +703,25 @@ static void ss_push_slot(int slot)
 	 * card then keeps its old parent, pushes again on the next save, and is
 	 * told 409 by a server that is simply ahead of us.
 	 *
-	 * Asking where the head is settles it. If it sits exactly where this
-	 * push would have put it, the bytes are the ones we sent. */
+	 * A server from M13 onwards remembers the reply and gives it again, so
+	 * this never fires against one -- docs/PROTOCOL.md, "A repeated PUSH_END
+	 * gets the same answer". It stays for the older ones, and because it is
+	 * cheap. Do not mistake it for the fix: it needs one more round trip to
+	 * survive immediately after a round trip did not, which is exactly when
+	 * that is least likely. On 2026-09-12 it did not survive, and a
+	 * committed v38 still went down as a failure.
+	 *
+	 * Asking where the head is settles it, as far as anything here can. If
+	 * it sits exactly where this push would have put it and holds a card the
+	 * size of ours, the bytes are almost certainly the ones we sent -- but
+	 * "almost" is doing real work in a house with two consoles, so the
+	 * server-side replay is what this actually rests on. */
 	if (rc != SS_OK && client.last_error_code == SS_NACK_STAGING_EXPIRED) {
 		uint32_t head = 0;
 		uint32_t head_size = 0;
 
 		if (ss_head(&client, s->game_id, (u8)slot, &head, &head_size) == SS_OK
-		    && head == s->parent + 1) {
+		    && head == s->parent + 1 && head_size == size) {
 			sslog("SlotSync: %s: commit ACK lost, but the server is on "
 			      "v%u -- our push landed\r\n", s->game_id, (u32)head);
 			assigned = head;

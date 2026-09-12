@@ -130,6 +130,34 @@ had accumulated. A client that resends `PUSH_BEGIN` is retrying, and keeping hal
 bytes from an earlier attempt is how you produce a card that passes its checksum and is
 still wrong.
 
+## A repeated `PUSH_END` gets the same answer
+
+`PUSH_END` is the last datagram of a push, which makes its reply the one datagram nobody
+retransmits on a timer. If it is lost, the client asks again — and the staging buffer it
+is asking about is gone, because the server drops it the moment it decides. Dropping it
+is right: it holds a whole card. Forgetting the *decision* is not.
+
+So the server keeps the reply — ACK with the assigned version, or the same NACK — keyed
+like the staging buffer and for the same 120 seconds, and **replays it verbatim** for a
+repeated `PUSH_END`. A transfer is decided once; asking twice does not re-decide it, and
+never commits a second version.
+
+This matters for the failures as much as the success. A client told `0x07` resends the
+whole card; one told `0x0B` instead concludes the push failed and waits for the next
+save. Replaying the real verdict is what keeps that fallback reachable.
+
+Without this, `0x0B` is ambiguous in the worst way: it means both "your transfer expired"
+and "your transfer succeeded and you missed the receipt". Hardware bore that out on
+2026-09-12 — a committed `v38` came back as `0x0B`, the console recorded the push as
+failed, kept its old parent, and had its next save refused as a conflict against the
+version it had itself just written. `server/scripts/fake_console.py push --lose-end-reply`
+reproduces it on demand.
+
+A `PUSH_BEGIN` arriving after a transfer has settled clears the remembered reply: a
+client that has reached `PUSH_END` retransmits *that*, never `PUSH_BEGIN`, so a
+`PUSH_BEGIN` on a settled key is a new attempt reusing the id, and answering it later
+with the previous attempt's verdict would be a lie.
+
 ## `HELLO` ack payload
 
 ```

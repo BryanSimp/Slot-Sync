@@ -157,7 +157,15 @@ happened.
   overwritten on either side.
 - **Bring-up works on both consoles** — 1.5 s to a DHCP address on the Wii, 2.5 s on the
   Wii U. vWii was expected to be the hard case and was not.
-- `tests/` — 50 host checks, plus a live round trip against a real server.
+- **Delta push works** (2026-09-12). `pushing GXXE01 slot A, 176 of 2048 chunks changed,
+  parent v37` was committed by the server as v38, attributed to the kernel's own device
+  id. It reassembled byte-perfect: `PUSH_END` carries the digest of the client's *whole*
+  card, so a delta that landed on the wrong parent bytes would have been refused, and
+  this one was not.
+- **The fingerprint store is read off the SD card on hardware** —
+  `slot A can delta from v37 straight away`, from the file the launcher wrote. That is
+  the kernel's own FatFs reader, which had only ever run against a host stand-in.
+- `tests/` — 80 host checks, plus a live round trip against a real server.
 
 **What it cost to get there**, because the list is the useful part:
 
@@ -173,6 +181,20 @@ an IOS message queue per call; and a refused send treated as fatal.
 
 None of those failed loudly. Most looked exactly like "the server is unreachable".
 
+And one more, found on 2026-09-12 and fixed in the server rather than here: **a lost
+`PUSH_END` ack turned a committed push into a reported failure.** The server dropped the
+staging buffer the moment it committed, so the retransmitted `PUSH_END` was answered
+`STAGING_EXPIRED` -- a code that meant both "your transfer expired" and "your transfer
+succeeded and you missed the receipt". The console recorded the push as failed, kept its
+old parent, and had its next save refused as a conflict against the version it had itself
+just written. Nothing was lost and nothing was overwritten; the card simply halted and
+the save sat on the SD card until a human corrected `state.txt`.
+
+The fix is that a repeated `PUSH_END` now gets the same answer replayed --
+`docs/PROTOCOL.md`, "A repeated `PUSH_END` gets the same answer". It belongs there rather
+than in either client: the launcher had no recovery for this at all, and the kernel's
+needed one more round trip to survive immediately after a round trip had not.
+
 **Not verified, and it would need someone to go and try it:**
 
 - **BBA emulation on.** Every run has had it off. See the note in Configuration.
@@ -184,11 +206,13 @@ None of those failed loudly. Most looked exactly like "the server is unreachable
   the chunk bitmap's limit, with no headroom. Delta push makes this much less pressing —
   a save is a few dozen chunks whatever the card's size — but the whole-card fallback
   still has to fit, and nobody has run one.
-- **Delta push on hardware.** It works over real sockets in `tests/` and the card pulls
-  back byte-identical, but no console has sent one.
-- **The fingerprint store on hardware.** The format round-trips and a reloaded table
-  deltas correctly in `wii/tests`, but the kernel's own reader and writer are FatFs and
-  have only ever run against a host stand-in for the bytes.
+- **The fingerprint handoff being *written*.** `SlotSync_Init` reading
+  `/slotsync/fingerprints.bin` is verified; `SlotSync_Shutdown` writing
+  `/slotsync/runtime-fp.bin` is not. Both hardware runs so far ended with the console
+  powered off rather than exited, and Shutdown is where the handoff is written -- so
+  neither it nor `runtime.txt` has ever been produced on a console.
+- **A session that ends cleanly.** Which is the same gap from the other side: nothing has
+  yet exercised `SlotSync_Shutdown` at all.
 
 ## Testing it
 
